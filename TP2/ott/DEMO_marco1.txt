@@ -1,0 +1,81 @@
+DEMONSTRACAO DO MARCO 1 - ARRANQUE COM BOOTSTRAPPER + HELLO (TP2 ESR)
+=====================================================================
+
+O QUE ESTA DEMONSTRACAO PROVA
+  1. Todo o trafego e UDP, com mensagens binarias (struct) e fiabilidade propria (ACK + retransmissao).
+  2. O bootstrapper so recebe um REGISTER por no e responde com a lista de vizinhos. Depois NAO faz mais nada.
+  3. Cada no fica a conhecer apenas os seus vizinhos diretos (nunca o grafo todo).
+  4. A ordem de arranque dos nos nao importa (um no que arranca tarde e aprendido pelos vizinhos).
+
+0. PREPARAR OS FICHEIROS (uma vez)
+----------------------------------
+  Copiar a pasta "ott" inteira para o Desktop da VM (fica em /home/core/Desktop/ott).
+  Todos os nos do CORE partilham o sistema de ficheiros, por isso basta uma copia.
+    cd /home/core/Desktop/ott && python3 -m unittest discover -s tests     # deve acabar em OK
+
+1. ACRESCENTAR A REDE DE GESTAO NO CORE
+---------------------------------------
+  A rede de gestao e so para o bootstrapper. O overlay continua nas ligacoes diretas (S1-N1, N1-C1, N1-C2).
+  a) Na paleta: "Link Layer Nodes" -> switch. Pousar na area de desenho.
+  b) Acrescentar um no do tipo PC e chamar-lhe B (de bootstrapper).
+  c) Ligar com o "Link tool": B-switch, S1-switch, N1-switch, C1-switch, C2-switch.
+  d) Play. Em cada terminal (B, S1, N1, C1, C2):   ip -br a
+     Anotar o IP da interface ligada ao switch em B (ex.: 10.0.3.20). E esse que vai em --boot.
+     Confirmar que os IPs das ligacoes diretas continuam: S1 10.0.0.20, N1 10.0.0.1 / 10.0.1.1 / 10.0.2.1,
+     C2 10.0.1.20, C1 10.0.2.20. Se algum for diferente, editar cenarios/cenario1.json (campos a_addr/b_addr).
+     (Os campos "mgmt" do JSON so servem ao simulador; o bootstrapper real nao os usa.)
+
+2. CAPTURA NO BOOTSTRAPPER (para provar que ele nao trabalha depois)
+--------------------------------------------------------------------
+  Abrir um 2.o terminal em B:
+    tcpdump -n -i any udp port 9000
+
+3. LANCAR (ordem e irrelevante; fazer de proposito fora de ordem)
+-----------------------------------------------------------------
+  Terminal de B (bootstrapper):
+    python3 /home/core/Desktop/ott/ott.py bootstrap --topology /home/core/Desktop/ott/cenarios/cenario1.json --trace
+  Terminal de C2 (primeiro, para mostrar que a ordem nao interessa):
+    python3 /home/core/Desktop/ott/ott.py node --name C2 --boot IP_DO_B:9000 --trace
+  Terminal de S1:
+    python3 /home/core/Desktop/ott/ott.py node --name S1 --boot IP_DO_B:9000 --trace
+  Terminal de C1:
+    python3 /home/core/Desktop/ott/ott.py node --name C1 --boot IP_DO_B:9000 --trace
+  Terminal de N1 (por ultimo):
+    python3 /home/core/Desktop/ott/ott.py node --name N1 --boot IP_DO_B:9000 --trace
+  (Substituir IP_DO_B pelo IP anotado no passo 1d. Colar so o comando, sem rotulos.)
+
+4. O QUE DEVE APARECER E O QUE DIZER
+------------------------------------
+  Em B:       REGISTER de C2 / S1 / C1 / N1, cada um UMA vez, e depois silencio.
+  No tcpdump: 4 pedidos + 4 respostas e mais nada, mesmo deixando correr minutos.
+  Nos nos:    "JOINED; vizinhos: ..."  e depois  "vizinho vivo"  para cada vizinho.
+  Linhas "retransmito HELLO #n" sao normais quando o vizinho ainda nao arrancou: e a fiabilidade
+  propria sobre UDP a trabalhar. Quando o vizinho aparece, o ACK (ou o HELLO dele) fecha a conversa.
+
+  Pontos a dizer:
+   - Um unico programa para todos os nos; so muda o nome.
+   - UDP puro: cada mensagem tem cabecalho de 4 bytes (versao, tipo, msg_id) + corpo binario.
+   - Fiabilidade nossa: ACK + retransmissao com recuo exponencial (HELLO: 0.2 s, 0.4 s, 0.8 s ...).
+   - O NEIGHBOURS leva o msg_id do REGISTER: serve de confirmacao, por isso o bootstrapper nao guarda
+     estado nenhum (pode reiniciar a qualquer momento).
+   - Depois de entrar, o no nunca mais contacta o bootstrapper (ha uma guarda no codigo que falha se tentar).
+   - Se o N1 for morto e relancado, faz exatamente um REGISTER novo.
+
+5. EXTRA PARA MOSTRAR: PERDA DE PACOTES
+---------------------------------------
+  Em N1, antes de lancar os nos (ou com a sessao ja a correr):
+    tc qdisc add dev eth0 root netem loss 30%        (trocar eth0 pela interface do lado de S1)
+  Mostrar os "retransmito HELLO" e o vizinho a ficar vivo na mesma. Para remover:
+    tc qdisc del dev eth0 root
+
+6. SIMULACAO (sem CORE; bom para o relatorio)
+---------------------------------------------
+    python3 ott.py sim --topology cenarios/cenario1.json --spread 0.5 --loss-gestao 0.3 --seed 3
+  Mostra o log e o trace de pacotes em tempo virtual, incluindo os pacotes perdidos.
+
+7. SE ALGO FALHAR
+-----------------
+  "Address already in use"   -> o programa ja corre nesse no; Ctrl+C e relancar.
+  "REGISTER sem resposta"    -> IP do B errado em --boot, ou falta a ligacao ao switch; testar: ping IP_DO_B.
+  Vizinho nunca fica vivo    -> IP da ligacao direta diferente do JSON (ver passo 1d) ou nos em sessoes distintas.
+  Nada acontece no tcpdump   -> usar "-i any"; confirmar que o B esta mesmo ligado ao switch.
