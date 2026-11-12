@@ -15,7 +15,7 @@ Cada datagrama UDP de controlo comeca por um cabecalho de 4 bytes:
 Um "nome" e um byte de comprimento seguido de ASCII (1 a 31 caracteres).
 Um IPv4 ocupa 4 bytes e uma porta 2 bytes.
 """
-cat << 'EOF' > /home/core/Overlay-/TP2/ott/ottlib/wire.py
+
 """Formato das mensagens (binario, big-endian) - Marco 1 & 2."""
 import socket
 import struct
