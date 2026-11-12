@@ -32,6 +32,12 @@ REGISTER_RTO0, REGISTER_RTO_MAX, REGISTER_TRIES = 0.5, 4.0, 10
 # 0.2, 0.4, 0.8, 1.6, 3.2 s  (cerca de 6 s no total) ate MAX tentativas.
 HELLO_RTO0, HELLO_RTO_MAX, HELLO_TRIES = 0.2, 4.0, 5
 
+# HELLO periodico (monitorizacao dos vizinhos). A cada HELLO_INTERVAL o no sonda cada vizinho
+# com um HELLO SEM retransmissao; se nao ouvir nada dele durante HELLO_DEAD_AFTER, declara-o
+# caido. A deteccao demora entre DEAD_AFTER e DEAD_AFTER + INTERVAL.
+HELLO_INTERVAL, HELLO_DEAD_AFTER = 1.0, 3.0
+RTT_ALPHA = 0.125     # peso da amostra nova no RTT suavizado (o mesmo valor do TCP)
+
 # estados do no
 INIT, REGISTERING, JOINED, ORPHAN = "INIT", "REGISTERING", "JOINED", "ORPHAN"
 
@@ -48,23 +54,26 @@ class Pending:
 
 class Vizinho:
     """O que um no sabe de um vizinho: so isto. Nunca o grafo completo."""
-    __slots__ = ("name", "addr", "alive", "last_heard")
+    __slots__ = ("name", "addr", "alive", "last_heard", "rtt", "srtt")
 
     def __init__(self, name, addr):
         self.name, self.addr = name, addr
         self.alive, self.last_heard = False, None
+        self.rtt = self.srtt = None     # ultimo RTT medido e RTT suavizado (segundos)
 
     def __repr__(self):
         return f"Vizinho({self.name}, {self.addr}, {'vivo' if self.alive else 'sem contacto'})"
 
 
 class Node:
-    def __init__(self, name, boot_addr):
+    def __init__(self, name, boot_addr, hello_interval=HELLO_INTERVAL, dead_after=HELLO_DEAD_AFTER):
         self.name = name
         self.boot_addr = tuple(boot_addr)
+        self.hello_interval, self.dead_after = hello_interval, dead_after
         self.state = INIT
         self.vizinhos = {}        # nome -> Vizinho
-        self.pending = {}         # msg_id -> Pending
+        self.pending = {}         # msg_id -> Pending (mensagens fiaveis, com retransmissao)
+        self.probes = {}          # msg_id -> (nome do vizinho, instante de envio): HELLO periodico
         self._next_id = 1
 
     # ------------------------------------------------------------ utilitarios
@@ -72,7 +81,7 @@ class Node:
         for _ in range(0x10000):
             mid = self._next_id
             self._next_id = self._next_id % 0xFFFF + 1     # 1..65535 (0 fica livre)
-            if mid not in self.pending:
+            if mid not in self.pending and mid not in self.probes:
                 return mid
         raise RuntimeError("sem msg_id livres")
 
@@ -128,6 +137,8 @@ class Node:
         acts = []
         if key[0] == "rtx":
             self._on_rtx(acts, key[1])
+        elif key[0] == "tick":
+            self._on_tick(acts, now)
         return acts
 
     # ------------------------------------------------------------ retransmissao
@@ -142,7 +153,8 @@ class Node:
                 acts.append(Log(f"REGISTER sem resposta apos {p.tries} tentativas: desisto"))
             else:
                 acts.append(Log(f"{p.kind} para {p.peer} sem ACK apos {p.tries} tentativas "
-                                f"(o vizinho pode ainda nao ter arrancado)"))
+                                f"(o vizinho pode ainda nao ter arrancado; continuo a sondar "
+                                f"a cada {self.hello_interval:g}s)"))
             return
         p.tries += 1
         p.rto = min(p.rto * 2, p.rto_max)
@@ -159,12 +171,20 @@ class Node:
         entries = wire.dec_neighbours(payload)
         self.state = JOINED
         acts.append(Log(f"JOINED; vizinhos: " + (", ".join(f"{n}@{ip}" for n, ip, _ in entries) or "(nenhum)")))
+        if not entries:
+            acts.append(Log(f"AVISO: JOINED sem vizinhos. O bootstrapper conhece o nome {self.name!r}? "
+                            f"Tem de ser igual ao do cenario, maiusculas incluidas."))
         for nome, ip, porta in entries:
-            self.vizinhos[nome] = Vizinho(nome, (ip, porta))
+            if nome in self.vizinhos:
+                # ja o aprendemos por um HELLO dele: nao perder o estado, so fixar o endereco do bootstrapper
+                self.vizinhos[nome].addr = (ip, porta)
+            else:
+                self.vizinhos[nome] = Vizinho(nome, (ip, porta))
             hid = self._new_id()
             data = wire.enc_name_msg(wire.T_HELLO, hid, self.name)
             self._send_reliable(acts, (ip, porta), hid, data,
                                 HELLO_RTO0, HELLO_RTO_MAX, HELLO_TRIES, "HELLO", peer=nome)
+        acts.append(SetTimer(("tick",), self.hello_interval))     # arranca a monitorizacao
 
     def _on_hello(self, acts, now, src, mid, payload):
         """Um vizinho diz quem e. Respondemos sempre com ACK (o ACK pode ter-se perdido
@@ -176,11 +196,16 @@ class Node:
             # vizinho que o bootstrapper nao nos indicou (ex.: no novo): aprendemo-lo aqui
             v = self.vizinhos[nome] = Vizinho(nome, tuple(src))
         if not v.alive:
+            voltou = v.last_heard is not None
             v.alive = True
-            acts.append(Log(f"HELLO de {nome} ({src[0]}): vizinho vivo"))
+            acts.append(Log(f"HELLO de {nome} ({src[0]}): vizinho {'voltou' if voltou else 'vivo'}"))
         v.last_heard = now
 
     def _on_ack(self, acts, now, src, mid, payload):
+        sonda = self.probes.pop(mid, None)
+        if sonda is not None:                   # ACK a um HELLO periodico
+            self._on_sonda_ack(acts, now, src, *sonda)
+            return
         p = self._settle(acts, mid)
         if p is None:
             return                              # ACK repetido
@@ -190,6 +215,43 @@ class Node:
                 v.alive = True
                 acts.append(Log(f"ACK de {p.peer} ({src[0]}): vizinho vivo ({p.tries} tentativa(s))"))
             v.last_heard = now
+
+    # ------------------------------------------------------------ monitorizacao dos vizinhos
+    def _on_tick(self, acts, now):
+        """A cada HELLO_INTERVAL: (1) detetar vizinhos calados, (2) sondar todos os vizinhos."""
+        acts.append(SetTimer(("tick",), self.hello_interval))
+        self.probes = {m: pr for m, pr in self.probes.items() if now - pr[1] < self.dead_after}
+        for v in self.vizinhos.values():
+            if v.alive and v.last_heard is not None and now - v.last_heard > self.dead_after:
+                self._vizinho_caiu(acts, now, v)
+            # Sondar tambem os que nao estao vivos: e assim que se deteta o regresso de um vizinho
+            # (e que um HELLO fiavel desistido de arranque ganha nova oportunidade).
+            if any(p.kind == "HELLO" and p.peer == v.name for p in self.pending.values()):
+                continue                        # o HELLO fiavel de arranque ainda esta em curso
+            mid = self._new_id()
+            self.probes[mid] = (v.name, now)
+            self._send(acts, v.addr, wire.enc_name_msg(wire.T_HELLO, mid, self.name))
+
+    def _on_sonda_ack(self, acts, now, src, nome, t_envio):
+        """ACK a um HELLO periodico: prova de vida e amostra limpa de RTT (um unico envio, sem
+        retransmissoes, por isso sem ambiguidade; o HELLO de arranque nao serve para isto)."""
+        v = self.vizinhos.get(nome)
+        if v is None:
+            return
+        v.rtt = now - t_envio
+        v.srtt = v.rtt if v.srtt is None else (1 - RTT_ALPHA) * v.srtt + RTT_ALPHA * v.rtt
+        if not v.alive:
+            voltou = v.last_heard is not None
+            v.alive = True
+            acts.append(Log(f"ACK de {nome} ({src[0]}): vizinho {'voltou' if voltou else 'vivo'}"))
+        v.last_heard = now
+
+    def _vizinho_caiu(self, acts, now, v):
+        """Um vizinho deixou de dar sinal. Ponto de extensao do Marco 2: e aqui que se invalidam
+        as rotas que passavam por este vizinho."""
+        acts.append(Log(f"vizinho {v.name} CAIU (sem sinal ha {now - v.last_heard:.1f}s)"))
+        v.alive = False
+        v.rtt = v.srtt = None
 
 
 class Bootstrapper:
@@ -219,7 +281,8 @@ class Bootstrapper:
             return acts
         lista = self.tabela.get(nome)
         if lista is None:
-            acts.append(Log(f"REGISTER de no desconhecido {nome!r} ({src[0]}): lista vazia"))
+            acts.append(Log(f"REGISTER de no desconhecido {nome!r} ({src[0]}): lista vazia; "
+                            f"nomes conhecidos: {', '.join(sorted(self.tabela))}"))
             lista = []
         else:
             acts.append(Log(f"REGISTER de {nome} ({src[0]}): {len(lista)} vizinho(s)"))
