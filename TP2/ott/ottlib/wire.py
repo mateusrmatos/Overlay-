@@ -1,4 +1,4 @@
-"""Formato das mensagens (binario, big-endian) - Marco 1.
+"""Formato das mensagens (binario, big-endian) - Marco 1 & 2.
 
 Cada datagrama UDP de controlo comeca por um cabecalho de 4 bytes:
 
@@ -26,12 +26,12 @@ T_NEIGHBOURS = 2   # bootstrapper -> no:  lista de vizinhos (nome, ip, porta)
 T_HELLO = 3        # no -> vizinho:       "sou o N1" (fiavel: espera ACK)
 T_ACK = 4          # confirmacao de uma mensagem fiavel
 
-# --- reservados para os marcos seguintes (nao usados ainda)
-T_ADVERT = 5
+# --- tipos usados no Marco 2 (Rotas) e seguintes
+T_ADVERT = 5       # anuncio de rota (stream, servidor, seq, metrica)
 T_QUERY = 6
 T_REPLY = 7
-T_ACTIVATE = 8
-T_DEACTIVATE = 9
+T_ACTIVATE = 8     # pedido de ativacao de fluxo (downstream -> upstream)
+T_DEACTIVATE = 9   # cancelamento de fluxo (downstream -> upstream)
 T_PROBE = 10
 T_ECHO = 11
 T_DATA = 12
@@ -43,7 +43,8 @@ NOMES = {
 }
 
 HDR = struct.Struct("!BBH")
-_ENTRY_TAIL = struct.Struct("!4sH")   # ip (4 bytes) + porta (2 bytes)
+_ENTRY_TAIL = struct.Struct("!4sH")    # ip (4 bytes) + porta (2 bytes)
+_ADVERT_TAIL = struct.Struct("!HI")    # seq (2 bytes) + custo escalado em milesimas (4 bytes)
 
 
 class WireError(ValueError):
@@ -71,7 +72,10 @@ def _unpack_name(buf, off):
     end = off + 1 + n
     if n == 0 or end > len(buf):
         raise WireError("nome truncado")
-    return buf[off + 1:end].decode("ascii"), end
+    try:
+        return buf[off + 1:end].decode("ascii"), end
+    except UnicodeDecodeError:
+        raise WireError("nome nao-ASCII no pacote")
 
 
 def encode(tipo, msg_id, payload=b""):
@@ -108,26 +112,4 @@ def enc_neighbours(msg_id, entries):
         raise WireError("vizinhos a mais")
     body = bytes([len(entries)])
     for name, ip, port in entries:
-        body += _pack_name(name) + _ENTRY_TAIL.pack(socket.inet_aton(ip), port)
-    return encode(T_NEIGHBOURS, msg_id, body)
-
-
-def dec_neighbours(payload):
-    if not payload:
-        raise WireError("lista vazia sem contador")
-    count, off, out = payload[0], 1, []
-    for _ in range(count):
-        name, off = _unpack_name(payload, off)
-        if off + _ENTRY_TAIL.size > len(payload):
-            raise WireError("entrada truncada")
-        ip, port = _ENTRY_TAIL.unpack_from(payload, off)
-        off += _ENTRY_TAIL.size
-        out.append((name, socket.inet_ntoa(ip), port))
-    if off != len(payload):
-        raise WireError("bytes a mais")
-    return out
-
-
-# ---------------------------------------------------------------- ACK
-def enc_ack(msg_id):
-    return encode(T_ACK, msg_id)
+        body += _pack_name(name) + _ENTRY_TAIL.pack(socket

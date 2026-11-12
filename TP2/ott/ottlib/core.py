@@ -1,4 +1,4 @@
-"""Nucleo do protocolo (sans-I/O) - Marco 1.
+"""Nucleo do protocolo (sans-I/O) - Marco 1 & 2.
 
 Ideia central: este modulo NAO abre sockets, NAO dorme, NAO le o relogio.
 Recebe EVENTOS (arrancar, chegou um pacote, expirou um temporizador) e devolve ACOES
@@ -65,6 +65,34 @@ class Vizinho:
         return f"Vizinho({self.name}, {self.addr}, {'vivo' if self.alive else 'sem contacto'})"
 
 
+# === [PONTO A: CLASSE ROTA ADICIONADA AQUI] ===
+class Rota:
+    """Entrada na tabela de encaminhamento para um fluxo (stream).
+    Mantem a rota principal (origem, custo) e caminhos alternativos conhecidos."""
+    __slots__ = ("stream", "server", "origem", "custo", "seq", "destinos", "alternativas")
+
+    def __init__(self, stream, server, origem, custo, seq):
+        self.stream = stream              # ex: "video1"
+        self.server = server              # ex: "S1" (servidor que gera a stream)
+        self.origem = origem              # nome do vizinho upstream (ex: "N1"), ou None se invalida
+        self.custo = custo                # metrica acumulada ate ao servidor
+        self.seq = seq                    # ultimo num de sequencia visto do servidor
+        self.destinos = set()             # nomes dos vizinhos downstream que pediram o fluxo
+        self.alternativas = {}            # {nome_vizinho: (custo, seq)} para failover rapido
+
+    @property
+    def ativa(self):
+        """A rota esta ativa se temos por onde receber e alguem a quem entregar."""
+        return self.origem is not None and len(self.destinos) > 0
+
+    def __repr__(self):
+        est = "ATIVA" if self.ativa else ("INATIVA" if self.origem else "SEM_ORIGEM")
+        dsts = ",".join(sorted(self.destinos)) or "-"
+        c_str = f"{self.custo:g}" if self.custo != float("inf") else "inf"
+        return (f"Rota(fluxo={self.stream}, srv={self.server}, origem={self.origem}, "
+                f"custo={c_str}, destinos=[{dsts}], estado={est})")
+
+
 class Node:
     def __init__(self, name, boot_addr, hello_interval=HELLO_INTERVAL, dead_after=HELLO_DEAD_AFTER):
         self.name = name
@@ -72,8 +100,9 @@ class Node:
         self.hello_interval, self.dead_after = hello_interval, dead_after
         self.state = INIT
         self.vizinhos = {}        # nome -> Vizinho
-        self.pending = {}         # msg_id -> Pending (mensagens fiaveis, com retransmissao)
-        self.probes = {}          # msg_id -> (nome do vizinho, instante de envio): HELLO periodico
+        self.rotas = {}           # stream -> Rota (Tabela de Rotas)  <-- [PONTO B AQUI]
+        self.pending = {}         # msg_id -> Pending (mensagens fiaveis)
+        self.probes = {}          # msg_id -> (nome, t_envio): HELLO periodico
         self._next_id = 1
 
     # ------------------------------------------------------------ utilitarios
@@ -247,11 +276,111 @@ class Node:
         v.last_heard = now
 
     def _vizinho_caiu(self, acts, now, v):
-        """Um vizinho deixou de dar sinal. Ponto de extensao do Marco 2: e aqui que se invalidam
-        as rotas que passavam por este vizinho."""
+        """Um vizinho deixou de dar sinal. Invalida/recalcula rotas que dependiam dele."""
         acts.append(Log(f"vizinho {v.name} CAIU (sem sinal ha {now - v.last_heard:.1f}s)"))
         v.alive = False
         v.rtt = v.srtt = None
+        self._remover_vizinho_das_rotas(acts, v.name)
+
+    # === [PONTO C: METODOS DA TABELA DE ROTAS ADICIONADOS AQUI DENTRO DE NODE] ===
+    def custo_ligacao(self, nome_vizinho):
+        """Metrica da ligacao ate ao vizinho.
+        Usa 1.0 (contagem de saltos) por omissao, ou podera usar v.srtt quando quiserem."""
+        return 1.0
+
+    def atualizar_rota(self, acts, stream, server, vizinho_origem, custo_anunciado, seq):
+        """Avalia um anuncio de rota recebido de `vizinho_origem`.
+        Devolve True se a rota principal melhorou/mudou (sinal para fazer flood a seguir!)
+        ou False se foi ignorada ou guardada apenas como alternativa."""
+        if vizinho_origem not in self.vizinhos:
+            return False
+
+        novo_custo = custo_anunciado + self.custo_ligacao(vizinho_origem)
+        r = self.rotas.get(stream)
+
+        # Caso 1: Fluxo totalmente novo para este no
+        if r is None:
+            r = self.rotas[stream] = Rota(stream, server, vizinho_origem, novo_custo, seq)
+            acts.append(Log(f"rota criada: {r}"))
+            return True
+
+        # Ignorar anuncios antigos (seq menor)
+        if seq < r.seq:
+            return False
+
+        # Caso 2: Nova ronda de anuncio do servidor (seq mais recente)
+        if seq > r.seq:
+            r.alternativas.clear()
+            r.server = server
+            r.seq = seq
+            r.origem = vizinho_origem
+            r.custo = novo_custo
+            acts.append(Log(f"rota atualizada (seq={seq}): {r}"))
+            return True
+
+        # Caso 3: Mesmo seq (anuncio que chegou por outro caminho na mesma inundacao)
+        if vizinho_origem == r.origem:
+            if novo_custo < r.custo:
+                r.custo = novo_custo
+                return True
+            return False
+
+        # Se o novo caminho for estritamente melhor que a origem atual, promovemos!
+        if r.origem is None or novo_custo < r.custo:
+            if r.origem is not None:
+                r.alternativas[r.origem] = (r.custo, r.seq)
+            r.origem = vizinho_origem
+            r.custo = novo_custo
+            r.alternativas.pop(vizinho_origem, None)
+            acts.append(Log(f"melhor rota encontrada para {stream} via {vizinho_origem} (custo {novo_custo:g})"))
+            return True
+
+        # Caso 4: Caminho mais longo ou igual -> guarda-se como rota alternativa de backup
+        antigo = r.alternativas.get(vizinho_origem)
+        if antigo is None or novo_custo < antigo[0]:
+            r.alternativas[vizinho_origem] = (novo_custo, seq)
+        return False
+
+    def adicionar_destino_rota(self, acts, stream, vizinho_destino):
+        """Um vizinho a jusante pediu para receber a stream (ACTIVATE)."""
+        r = self.rotas.get(stream)
+        if r is None:
+            return False
+        estava_ativa = r.ativa
+        r.destinos.add(vizinho_destino)
+        if not estava_ativa and r.ativa:
+            acts.append(Log(f"rota {stream} passou a ATIVA -> destinos: {sorted(r.destinos)}"))
+        return not estava_ativa and r.ativa
+
+    def remover_destino_rota(self, acts, stream, vizinho_destino):
+        """Um vizinho a jusante deixou de querer a stream (DEACTIVATE ou caiu)."""
+        r = self.rotas.get(stream)
+        if r is None or vizinho_destino not in r.destinos:
+            return False
+        estava_ativa = r.ativa
+        r.destinos.discard(vizinho_destino)
+        if estava_ativa and not r.ativa:
+            acts.append(Log(f"rota {stream} passou a INATIVA (sem clientes)"))
+        return estava_ativa and not r.ativa
+
+    def _remover_vizinho_das_rotas(self, acts, nome_viz):
+        """Limpa um vizinho caido das tabelas e ativa rotas alternativas se existirem."""
+        for r in self.rotas.values():
+            r.alternativas.pop(nome_viz, None)
+            if nome_viz in r.destinos:
+                self.remover_destino_rota(acts, r.stream, nome_viz)
+
+            if r.origem == nome_viz:
+                validas = {v: (c, s) for v, (c, s) in r.alternativas.items()
+                           if v in self.vizinhos and self.vizinhos[v].alive}
+                if validas:
+                    melhor_v = min(validas, key=lambda v: validas[v][0])
+                    r.origem, (r.custo, r.seq) = melhor_v, r.alternativas.pop(melhor_v)
+                    acts.append(Log(f"failover da rota {r.stream}: nova origem {r.origem} (custo {r.custo:g})"))
+                else:
+                    r.origem, r.custo = None, float("inf")
+                    acts.append(Log(f"rota {r.stream} perdeu a origem {nome_viz} e nao tem alternativas!"))
+    # === [FIM DO PONTO C - A CLASSE NODE TERMINA AQUI] ===
 
 
 class Bootstrapper:
