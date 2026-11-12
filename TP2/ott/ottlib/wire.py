@@ -154,4 +154,4 @@ def enc_stream_msg(tipo, msg_id, stream):
 
 def dec_stream_msg(payload):
     return dec_name_msg(payload)
-EOF
+
