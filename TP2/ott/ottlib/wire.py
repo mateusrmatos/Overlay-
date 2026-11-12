@@ -55,7 +55,10 @@ def nome_do_tipo(t):
 
 
 def _pack_name(name):
-    raw = name.encode("ascii")
+    try:
+        raw = name.encode("ascii")
+    except UnicodeEncodeError:
+        raise WireError(f"nome nao-ASCII: {name!r}")
     if not 1 <= len(raw) <= 31:
         raise WireError(f"nome invalido: {name!r}")
     return bytes([len(raw)]) + raw
