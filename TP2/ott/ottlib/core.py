@@ -38,8 +38,16 @@ HELLO_RTO0, HELLO_RTO_MAX, HELLO_TRIES = 0.2, 4.0, 5
 HELLO_INTERVAL, HELLO_DEAD_AFTER = 1.0, 3.0
 RTT_ALPHA = 0.125     # peso da amostra nova no RTT suavizado (o mesmo valor do TCP)
 
+# Expiracao de rotas: sem anuncios durante ROUTE_STALE_AFTER, o seq expira (aceita reinicio do servidor)
+ROUTE_STALE_AFTER = 6.0
+
 # estados do no
 INIT, REGISTERING, JOINED, ORPHAN = "INIT", "REGISTERING", "JOINED", "ORPHAN"
+
+
+def _seq_mais_recente(a, b):
+    """True se o numero de sequencia de 16 bits `a` for mais recente do que `b`."""
+    return 0 < ((a - b) & 0xFFFF) < 0x8000
 
 
 class Pending:
@@ -65,42 +73,61 @@ class Vizinho:
         return f"Vizinho({self.name}, {self.addr}, {'vivo' if self.alive else 'sem contacto'})"
 
 
-# === [PONTO A: CLASSE ROTA ADICIONADA AQUI] ===
 class Rota:
     """Entrada na tabela de encaminhamento para um fluxo (stream).
     Mantem a rota principal (origem, custo) e caminhos alternativos conhecidos."""
-    __slots__ = ("stream", "server", "origem", "custo", "seq", "destinos", "alternativas")
+    __slots__ = (
+        "stream", "server", "origem", "custo", "seq", "last_updated",
+        "destinos", "alternativas", "local", "consumo_local",
+    )
 
-    def __init__(self, stream, server, origem, custo, seq):
+    def __init__(self, stream, server, origem, custo, seq, now=0.0, local=False):
         self.stream = stream              # ex: "video1"
         self.server = server              # ex: "S1" (servidor que gera a stream)
-        self.origem = origem              # nome do vizinho upstream (ex: "N1"), ou None se invalida
+        self.origem = origem              # nome do vizinho upstream (ex: "N1"), ou None
         self.custo = custo                # metrica acumulada ate ao servidor
-        self.seq = seq                    # ultimo num de sequencia visto do servidor
+        self.seq = seq                    # ultimo num de sequencia visto (ou None se expirado)
+        self.last_updated = now           # instante do ultimo anuncio valido recebido
         self.destinos = set()             # nomes dos vizinhos downstream que pediram o fluxo
         self.alternativas = {}            # {nome_vizinho: (custo, seq)} para failover rapido
+        self.local = local                # True no proprio servidor que origina a stream
+        self.consumo_local = False        # True no cliente que consome a stream localmente
+
+    @property
+    def tem_montante(self):
+        return self.local or self.origem is not None
+
+    @property
+    def tem_jusante(self):
+        return self.consumo_local or len(self.destinos) > 0
 
     @property
     def ativa(self):
-        """A rota esta ativa se temos por onde receber e alguem a quem entregar."""
-        return self.origem is not None and len(self.destinos) > 0
+        """A rota esta ativa se temos fonte (origem ou local) e interessados (destinos ou cliente local)."""
+        return self.tem_montante and self.tem_jusante
 
     def __repr__(self):
-        est = "ATIVA" if self.ativa else ("INATIVA" if self.origem else "SEM_ORIGEM")
-        dsts = ",".join(sorted(self.destinos)) or "-"
+        est = "ATIVA" if self.ativa else ("INATIVA" if self.tem_montante else "SEM_ORIGEM")
+        dsts = list(sorted(self.destinos))
+        if self.consumo_local:
+            dsts.append("LOCAL")
+        dst_str = ",".join(dsts) or "-"
+        orig_str = "LOCAL" if self.local else str(self.origem)
         c_str = f"{self.custo:g}" if self.custo != float("inf") else "inf"
-        return (f"Rota(fluxo={self.stream}, srv={self.server}, origem={self.origem}, "
-                f"custo={c_str}, destinos=[{dsts}], estado={est})")
+        return (f"Rota(fluxo={self.stream}, srv={self.server}, origem={orig_str}, "
+                f"custo={c_str}, destinos=[{dst_str}], estado={est})")
 
 
 class Node:
-    def __init__(self, name, boot_addr, hello_interval=HELLO_INTERVAL, dead_after=HELLO_DEAD_AFTER):
+    def __init__(self, name, boot_addr, hello_interval=HELLO_INTERVAL, dead_after=HELLO_DEAD_AFTER,
+                 route_stale_after=ROUTE_STALE_AFTER):
         self.name = name
         self.boot_addr = tuple(boot_addr)
         self.hello_interval, self.dead_after = hello_interval, dead_after
+        self.route_stale_after = route_stale_after
         self.state = INIT
         self.vizinhos = {}        # nome -> Vizinho
-        self.rotas = {}           # stream -> Rota (Tabela de Rotas)  <-- [PONTO B AQUI]
+        self.rotas = {}           # stream -> Rota (Tabela de Rotas)
         self.pending = {}         # msg_id -> Pending (mensagens fiaveis)
         self.probes = {}          # msg_id -> (nome, t_envio): HELLO periodico
         self._next_id = 1
@@ -247,19 +274,18 @@ class Node:
 
     # ------------------------------------------------------------ monitorizacao dos vizinhos
     def _on_tick(self, acts, now):
-        """A cada HELLO_INTERVAL: (1) detetar vizinhos calados, (2) sondar todos os vizinhos."""
+        """A cada HELLO_INTERVAL: (1) detetar vizinhos calados, (2) expirar rotas antigas, (3) sondar."""
         acts.append(SetTimer(("tick",), self.hello_interval))
         self.probes = {m: pr for m, pr in self.probes.items() if now - pr[1] < self.dead_after}
         for v in self.vizinhos.values():
             if v.alive and v.last_heard is not None and now - v.last_heard > self.dead_after:
                 self._vizinho_caiu(acts, now, v)
-            # Sondar tambem os que nao estao vivos: e assim que se deteta o regresso de um vizinho
-            # (e que um HELLO fiavel desistido de arranque ganha nova oportunidade).
             if any(p.kind == "HELLO" and p.peer == v.name for p in self.pending.values()):
                 continue                        # o HELLO fiavel de arranque ainda esta em curso
             mid = self._new_id()
             self.probes[mid] = (v.name, now)
             self._send(acts, v.addr, wire.enc_name_msg(wire.T_HELLO, mid, self.name))
+        self._expirar_rotas(acts, now)
 
     def _on_sonda_ack(self, acts, now, src, nome, t_envio):
         """ACK a um HELLO periodico: prova de vida e amostra limpa de RTT (um unico envio, sem
@@ -282,17 +308,63 @@ class Node:
         v.rtt = v.srtt = None
         self._remover_vizinho_das_rotas(acts, v.name)
 
-    # === [PONTO C: METODOS DA TABELA DE ROTAS ADICIONADOS AQUI DENTRO DE NODE] ===
+    # ------------------------------------------------------------ tabela de rotas
     def custo_ligacao(self, nome_vizinho):
         """Metrica da ligacao ate ao vizinho.
         Usa 1.0 (contagem de saltos) por omissao, ou podera usar v.srtt quando quiserem."""
         return 1.0
 
-    def atualizar_rota(self, acts, stream, server, vizinho_origem, custo_anunciado, seq):
+    def _enviar_controlo_rota(self, acts, tipo, nome_vizinho, stream):
+        """Envia ACTIVATE ou DEACTIVATE ao vizinho indicado (se existir e nao for local)."""
+        if nome_vizinho is None:
+            return
+        v = self.vizinhos.get(nome_vizinho)
+        if v is None:
+            return
+        mid = self._new_id()
+        self._send(acts, v.addr, wire.enc_stream_msg(tipo, mid, stream))
+
+    def registar_stream_local(self, stream):
+        """Usado no Servidor para registar na tabela uma stream que ele proprio gera."""
+        r = self.rotas.get(stream)
+        if r is None:
+            r = self.rotas[stream] = Rota(stream, self.name, None, 0.0, 0, local=True)
+        else:
+            r.local = True
+            r.server = self.name
+            r.origem = None
+            r.custo = 0.0
+        return r
+
+    def pedir_stream(self, acts, stream):
+        """Usado no Cliente quando quer comecar a assistir a uma stream."""
+        r = self.rotas.get(stream)
+        if r is None:
+            return False
+        estava_ativa = r.ativa
+        r.consumo_local = True
+        if not estava_ativa and r.ativa and not r.local:
+            acts.append(Log(f"rota {stream} passou a ATIVA (consumo local)"))
+            self._enviar_controlo_rota(acts, wire.T_ACTIVATE, r.origem, stream)
+        return not estava_ativa and r.ativa
+
+    def deixar_stream(self, acts, stream):
+        """Usado no Cliente quando deixa de assistir a uma stream."""
+        r = self.rotas.get(stream)
+        if r is None or not r.consumo_local:
+            return False
+        estava_ativa = r.ativa
+        r.consumo_local = False
+        if estava_ativa and not r.ativa and not r.local:
+            acts.append(Log(f"rota {stream} passou a INATIVA (fim de consumo local)"))
+            self._enviar_controlo_rota(acts, wire.T_DEACTIVATE, r.origem, stream)
+        return estava_ativa and not r.ativa
+
+    def atualizar_rota(self, acts, stream, server, vizinho_origem, custo_anunciado, seq, now=0.0):
         """Avalia um anuncio de rota recebido de `vizinho_origem`.
         Devolve True se a rota principal melhorou/mudou (sinal para fazer flood a seguir!)
         ou False se foi ignorada ou guardada apenas como alternativa."""
-        if vizinho_origem not in self.vizinhos:
+        if vizinho_origem not in self.vizinhos or server == self.name:
             return False
 
         novo_custo = custo_anunciado + self.custo_ligacao(vizinho_origem)
@@ -300,26 +372,50 @@ class Node:
 
         # Caso 1: Fluxo totalmente novo para este no
         if r is None:
-            r = self.rotas[stream] = Rota(stream, server, vizinho_origem, novo_custo, seq)
+            r = self.rotas[stream] = Rota(stream, server, vizinho_origem, novo_custo, seq, now=now)
             acts.append(Log(f"rota criada: {r}"))
             return True
 
-        # Ignorar anuncios antigos (seq menor)
-        if seq < r.seq:
+        if r.local:
+            return False
+
+        # Se a rota tinha expirado (r.seq is None), qualquer seq e aceite como novo
+        seq_novo = r.seq is None or _seq_mais_recente(seq, r.seq)
+        seq_igual = r.seq is not None and seq == r.seq
+
+        # Ignorar anuncios antigos
+        if not seq_novo and not seq_igual:
             return False
 
         # Caso 2: Nova ronda de anuncio do servidor (seq mais recente)
-        if seq > r.seq:
-            r.alternativas.clear()
+        if seq_novo:
+            # Evitar troca de origem precipitada se um caminho pior chegar primeiro nesta ronda
+            if not (vizinho_origem == r.origem or r.origem is None or novo_custo < r.custo):
+                r.alternativas[vizinho_origem] = (novo_custo, seq)
+                return False
+
+            origem_antiga = r.origem
+            tinha_jusante = r.tem_jusante
+            r.alternativas = {
+                v: (c, s) for v, (c, s) in r.alternativas.items()
+                if s is not None and (s == seq or _seq_mais_recente(s, seq))
+            }
+            r.alternativas.pop(vizinho_origem, None)
             r.server = server
             r.seq = seq
+            r.last_updated = now
             r.origem = vizinho_origem
             r.custo = novo_custo
             acts.append(Log(f"rota atualizada (seq={seq}): {r}"))
+            if tinha_jusante and vizinho_origem != origem_antiga:
+                self._enviar_controlo_rota(acts, wire.T_ACTIVATE, vizinho_origem, stream)
+                if origem_antiga is not None:
+                    self._enviar_controlo_rota(acts, wire.T_DEACTIVATE, origem_antiga, stream)
             return True
 
         # Caso 3: Mesmo seq (anuncio que chegou por outro caminho na mesma inundacao)
         if vizinho_origem == r.origem:
+            r.last_updated = now
             if novo_custo < r.custo:
                 r.custo = novo_custo
                 return True
@@ -327,12 +423,19 @@ class Node:
 
         # Se o novo caminho for estritamente melhor que a origem atual, promovemos!
         if r.origem is None or novo_custo < r.custo:
-            if r.origem is not None:
-                r.alternativas[r.origem] = (r.custo, r.seq)
+            origem_antiga = r.origem
+            tinha_jusante = r.tem_jusante
+            if origem_antiga is not None and r.custo != float("inf"):
+                r.alternativas[origem_antiga] = (r.custo, r.seq)
             r.origem = vizinho_origem
             r.custo = novo_custo
+            r.last_updated = now
             r.alternativas.pop(vizinho_origem, None)
             acts.append(Log(f"melhor rota encontrada para {stream} via {vizinho_origem} (custo {novo_custo:g})"))
+            if tinha_jusante and vizinho_origem != origem_antiga:
+                self._enviar_controlo_rota(acts, wire.T_ACTIVATE, vizinho_origem, stream)
+                if origem_antiga is not None:
+                    self._enviar_controlo_rota(acts, wire.T_DEACTIVATE, origem_antiga, stream)
             return True
 
         # Caso 4: Caminho mais longo ou igual -> guarda-se como rota alternativa de backup
@@ -348,9 +451,12 @@ class Node:
             return False
         estava_ativa = r.ativa
         r.destinos.add(vizinho_destino)
-        if not estava_ativa and r.ativa:
+        ativou_agora = not estava_ativa and r.ativa
+        if ativou_agora:
             acts.append(Log(f"rota {stream} passou a ATIVA -> destinos: {sorted(r.destinos)}"))
-        return not estava_ativa and r.ativa
+            if not r.local:
+                self._enviar_controlo_rota(acts, wire.T_ACTIVATE, r.origem, stream)
+        return ativou_agora
 
     def remover_destino_rota(self, acts, stream, vizinho_destino):
         """Um vizinho a jusante deixou de querer a stream (DEACTIVATE ou caiu)."""
@@ -359,9 +465,12 @@ class Node:
             return False
         estava_ativa = r.ativa
         r.destinos.discard(vizinho_destino)
-        if estava_ativa and not r.ativa:
+        desativou_agora = estava_ativa and not r.ativa
+        if desativou_agora:
             acts.append(Log(f"rota {stream} passou a INATIVA (sem clientes)"))
-        return estava_ativa and not r.ativa
+            if not r.local:
+                self._enviar_controlo_rota(acts, wire.T_DEACTIVATE, r.origem, stream)
+        return desativou_agora
 
     def _remover_vizinho_das_rotas(self, acts, nome_viz):
         """Limpa um vizinho caido das tabelas e ativa rotas alternativas se existirem."""
@@ -371,16 +480,30 @@ class Node:
                 self.remover_destino_rota(acts, r.stream, nome_viz)
 
             if r.origem == nome_viz:
+                tinha_jusante = r.tem_jusante
                 validas = {v: (c, s) for v, (c, s) in r.alternativas.items()
-                           if v in self.vizinhos and self.vizinhos[v].alive}
+                           if v in self.vizinhos and self.vizinhos[v].alive and c != float("inf")}
                 if validas:
                     melhor_v = min(validas, key=lambda v: validas[v][0])
                     r.origem, (r.custo, r.seq) = melhor_v, r.alternativas.pop(melhor_v)
                     acts.append(Log(f"failover da rota {r.stream}: nova origem {r.origem} (custo {r.custo:g})"))
+                    if tinha_jusante:
+                        self._enviar_controlo_rota(acts, wire.T_ACTIVATE, r.origem, r.stream)
                 else:
                     r.origem, r.custo = None, float("inf")
                     acts.append(Log(f"rota {r.stream} perdeu a origem {nome_viz} e nao tem alternativas!"))
-    # === [FIM DO PONTO C - A CLASSE NODE TERMINA AQUI] ===
+
+    def _expirar_rotas(self, acts, now):
+        """Se uma rota nao recebe ADVERT ha demasiado tempo, limpa o seq para aceitar reinicios do servidor."""
+        if self.route_stale_after is None:
+            return
+        for r in self.rotas.values():
+            if r.local or r.seq is None:
+                continue
+            if now - r.last_updated > self.route_stale_after:
+                r.seq = None
+                r.alternativas.clear()
+                acts.append(Log(f"rota {r.stream} expirou por falta de anuncios (pronta para re-sincronizar seq)"))
 
 
 class Bootstrapper:
