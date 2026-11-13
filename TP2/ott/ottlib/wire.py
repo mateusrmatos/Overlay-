@@ -15,23 +15,24 @@ Cada datagrama UDP de controlo comeca por um cabecalho de 4 bytes:
 Um "nome" e um byte de comprimento seguido de ASCII (1 a 31 caracteres).
 Um IPv4 ocupa 4 bytes e uma porta 2 bytes.
 """
-
-"""Formato das mensagens (binario, big-endian) - Marco 1 & 2."""
+import math
 import socket
 import struct
 
 VERSION = 1
 
-T_REGISTER = 1
-T_NEIGHBOURS = 2
-T_HELLO = 3
-T_ACK = 4
+# --- tipos usados no Marco 1
+T_REGISTER = 1     # no -> bootstrapper:  "sou o N1, quem sao os meus vizinhos?"
+T_NEIGHBOURS = 2   # bootstrapper -> no:  lista de vizinhos (nome, ip, porta)
+T_HELLO = 3        # no -> vizinho:       "sou o N1" (fiavel: espera ACK)
+T_ACK = 4          # confirmacao de uma mensagem fiavel
 
-T_ADVERT = 5
+# --- tipos usados no Marco 2 (Rotas) e seguintes
+T_ADVERT = 5       # anuncio de rota (stream, servidor, seq, metrica)
 T_QUERY = 6
 T_REPLY = 7
-T_ACTIVATE = 8
-T_DEACTIVATE = 9
+T_ACTIVATE = 8     # pedido de ativacao de fluxo (downstream -> upstream)
+T_DEACTIVATE = 9   # cancelamento de fluxo (downstream -> upstream)
 T_PROBE = 10
 T_ECHO = 11
 T_DATA = 12
@@ -43,8 +44,10 @@ NOMES = {
 }
 
 HDR = struct.Struct("!BBH")
-_ENTRY_TAIL = struct.Struct("!4sH")
-_ADVERT_TAIL = struct.Struct("!HI")
+_ENTRY_TAIL = struct.Struct("!4sH")    # ip (4 bytes) + porta (2 bytes)
+_ADVERT_TAIL = struct.Struct("!HI")    # seq (2 bytes) + custo escalado (4 bytes)
+_COST_SCALE = 1000                     # milissegundos / milésimas de unidade
+_COST_INF = 0xFFFFFFFF                 # valor reservado para float("inf")
 
 
 class WireError(ValueError):
@@ -83,6 +86,7 @@ def encode(tipo, msg_id, payload=b""):
 
 
 def decode(data):
+    """Devolve (tipo, msg_id, payload) ou levanta WireError."""
     if len(data) < HDR.size:
         raise WireError("datagrama mais curto do que o cabecalho")
     ver, tipo, msg_id = HDR.unpack_from(data)
@@ -91,7 +95,9 @@ def decode(data):
     return tipo, msg_id, data[HDR.size:]
 
 
+# ---------------------------------------------------------------- REGISTER / HELLO
 def enc_name_msg(tipo, msg_id, name):
+    """REGISTER e HELLO so levam o nome de quem envia."""
     return encode(tipo, msg_id, _pack_name(name))
 
 
@@ -102,7 +108,9 @@ def dec_name_msg(payload):
     return name
 
 
+# ---------------------------------------------------------------- NEIGHBOURS
 def enc_neighbours(msg_id, entries):
+    """entries: lista de (nome, ip_str, porta)."""
     if len(entries) > 255:
         raise WireError("vizinhos a mais")
     body = bytes([len(entries)])
@@ -127,31 +135,39 @@ def dec_neighbours(payload):
     return out
 
 
+# ---------------------------------------------------------------- ACK
 def enc_ack(msg_id):
     return encode(T_ACK, msg_id)
 
 
+# ---------------------------------------------------------------- ADVERT / ACTIVATE (Rotas)
 def enc_advert(msg_id, stream, server, seq, cost):
-    if cost < 0:
-        raise WireError(f"custo negativo: {cost}")
-    c_int = min(0xFFFFFFFF, int(round(cost * 1000)))
+    """Anuncio de rota: nome da stream, nome do servidor origem, num sequencia e metrica."""
+    if math.isnan(cost) or cost < 0:
+        raise WireError(f"custo invalido: {cost}")
+    if math.isinf(cost):
+        c_int = _COST_INF
+    else:
+        c_int = min(_COST_INF - 1, int(round(cost * _COST_SCALE)))
     body = _pack_name(stream) + _pack_name(server) + _ADVERT_TAIL.pack(seq & 0xFFFF, c_int)
     return encode(T_ADVERT, msg_id, body)
 
 
 def dec_advert(payload):
+    """Devolve (stream, server, seq, cost_float)."""
     stream, off = _unpack_name(payload, 0)
     server, off = _unpack_name(payload, off)
     if off + _ADVERT_TAIL.size != len(payload):
         raise WireError("ADVERT truncado ou com bytes a mais")
     seq, c_int = _ADVERT_TAIL.unpack_from(payload, off)
-    return stream, server, seq, c_int / 1000.0
+    cost = float("inf") if c_int == _COST_INF else c_int / _COST_SCALE
+    return stream, server, seq, cost
 
 
 def enc_stream_msg(tipo, msg_id, stream):
+    """Usado para T_ACTIVATE e T_DEACTIVATE: leva apenas o nome da stream."""
     return encode(tipo, msg_id, _pack_name(stream))
 
 
 def dec_stream_msg(payload):
     return dec_name_msg(payload)
-
