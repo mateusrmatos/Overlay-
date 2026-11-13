@@ -1,4 +1,4 @@
-"""Nucleo do protocolo (sans-I/O) - Marco 1 & 2.
+"""Nucleo do protocolo (sans-I/O) - Marco 1 & 2 (Flood + Rotas).
 
 Ideia central: este modulo NAO abre sockets, NAO dorme, NAO le o relogio.
 Recebe EVENTOS (arrancar, chegou um pacote, expirou um temporizador) e devolve ACOES
@@ -6,13 +6,6 @@ Recebe EVENTOS (arrancar, chegou um pacote, expirou um temporizador) e devolve A
 
     eventos:  start(now) | on_packet(now, src, data) | on_timer(now, key)
     acoes:    Send(dst, data) | SetTimer(key, delay) | CancelTimer(key) | Log(text)
-
-Quem executa as acoes decide se e rede real (runtime.py, asyncio) ou rede simulada
-(sim.py, tempo virtual). A logica e exatamente a mesma nos dois casos; por isso os
-testes na simulacao testam o codigo que depois corre no CORE.
-
-Enderecos (dst, src) sao tuplos (ip_str, porta).
-Compativel com Python 3.10.
 """
 from collections import namedtuple
 
@@ -25,20 +18,14 @@ CancelTimer = namedtuple("CancelTimer", "key")
 Log = namedtuple("Log", "text")
 
 # ------------------------------------------------------------------ parametros
-# REGISTER: o bootstrapper pode estar mais lento ou a rede perder pacotes.
-# Recuo exponencial 0.5, 1, 2, 4, 4, 4 ... (limitado a 4 s) ate MAX tentativas.
 REGISTER_RTO0, REGISTER_RTO_MAX, REGISTER_TRIES = 0.5, 4.0, 10
-# HELLO: vizinhos estao a 1 salto, por isso o RTO inicial e curto.
-# 0.2, 0.4, 0.8, 1.6, 3.2 s  (cerca de 6 s no total) ate MAX tentativas.
 HELLO_RTO0, HELLO_RTO_MAX, HELLO_TRIES = 0.2, 4.0, 5
 
-# HELLO periodico (monitorizacao dos vizinhos). A cada HELLO_INTERVAL o no sonda cada vizinho
-# com um HELLO SEM retransmissao; se nao ouvir nada dele durante HELLO_DEAD_AFTER, declara-o
-# caido. A deteccao demora entre DEAD_AFTER e DEAD_AFTER + INTERVAL.
 HELLO_INTERVAL, HELLO_DEAD_AFTER = 1.0, 3.0
-RTT_ALPHA = 0.125     # peso da amostra nova no RTT suavizado (o mesmo valor do TCP)
+RTT_ALPHA = 0.125
 
-# Expiracao de rotas: sem anuncios durante ROUTE_STALE_AFTER, o seq expira (aceita reinicio do servidor)
+# Flood periodico de rotas (Servidor -> Rede) e tempo de expiracao (3 periodos)
+ADVERT_INTERVAL = 2.0
 ROUTE_STALE_AFTER = 6.0
 
 # estados do no
@@ -67,7 +54,7 @@ class Vizinho:
     def __init__(self, name, addr):
         self.name, self.addr = name, addr
         self.alive, self.last_heard = False, None
-        self.rtt = self.srtt = None     # ultimo RTT medido e RTT suavizado (segundos)
+        self.rtt = self.srtt = None
 
     def __repr__(self):
         return f"Vizinho({self.name}, {self.addr}, {'vivo' if self.alive else 'sem contacto'})"
@@ -82,16 +69,16 @@ class Rota:
     )
 
     def __init__(self, stream, server, origem, custo, seq, now=0.0, local=False):
-        self.stream = stream              # ex: "video1"
-        self.server = server              # ex: "S1" (servidor que gera a stream)
-        self.origem = origem              # nome do vizinho upstream (ex: "N1"), ou None
-        self.custo = custo                # metrica acumulada ate ao servidor
-        self.seq = seq                    # ultimo num de sequencia visto (ou None se expirado)
-        self.last_updated = now           # instante do ultimo anuncio valido recebido
-        self.destinos = set()             # nomes dos vizinhos downstream que pediram o fluxo
-        self.alternativas = {}            # {nome_vizinho: (custo, seq)} para failover rapido
-        self.local = local                # True no proprio servidor que origina a stream
-        self.consumo_local = False        # True no cliente que consome a stream localmente
+        self.stream = stream
+        self.server = server
+        self.origem = origem
+        self.custo = custo
+        self.seq = seq
+        self.last_updated = now
+        self.destinos = set()
+        self.alternativas = {}
+        self.local = local
+        self.consumo_local = False
 
     @property
     def tem_montante(self):
@@ -120,30 +107,42 @@ class Rota:
 
 class Node:
     def __init__(self, name, boot_addr, hello_interval=HELLO_INTERVAL, dead_after=HELLO_DEAD_AFTER,
-                 route_stale_after=ROUTE_STALE_AFTER):
+                 advert_interval=ADVERT_INTERVAL, route_stale_after=ROUTE_STALE_AFTER,
+                 streams=(), watch=()):
         self.name = name
         self.boot_addr = tuple(boot_addr)
         self.hello_interval, self.dead_after = hello_interval, dead_after
+        self.advert_interval = advert_interval
         self.route_stale_after = route_stale_after
         self.state = INIT
         self.vizinhos = {}        # nome -> Vizinho
         self.rotas = {}           # stream -> Rota (Tabela de Rotas)
         self.pending = {}         # msg_id -> Pending (mensagens fiaveis)
         self.probes = {}          # msg_id -> (nome, t_envio): HELLO periodico
+        self. desejadas = set(watch)  # streams que este no (cliente) quer consumir
         self._next_id = 1
+        for s in streams:
+            self.registar_stream_local(s)
 
     # ------------------------------------------------------------ utilitarios
     def _new_id(self):
         for _ in range(0x10000):
             mid = self._next_id
-            self._next_id = self._next_id % 0xFFFF + 1     # 1..65535 (0 fica livre)
+            self._next_id = self._next_id % 0xFFFF + 1
             if mid not in self.pending and mid not in self.probes:
                 return mid
         raise RuntimeError("sem msg_id livres")
 
+    def _vizinho_por_addr(self, src):
+        """Identifica o Vizinho pelo IP de origem do pacote UDP."""
+        ip = src[0]
+        for v in self.vizinhos.values():
+            if v.addr[0] == ip:
+                return v
+        return None
+
     def _send(self, acts, dst, data):
-        """Unico ponto por onde sai um datagrama. Aqui vive a regra do enunciado:
-        depois de o no ter entrado na rede, o bootstrapper NAO volta a ser contactado."""
+        """Unico ponto por onde sai um datagrama. Depois de JOINED/ORPHAN, o bootstrapper nao e contactado."""
         if tuple(dst) == self.boot_addr and self.state in (JOINED, ORPHAN):
             raise AssertionError(f"{self.name}: tentativa de contactar o bootstrapper depois do arranque")
         acts.append(Send(tuple(dst), data))
@@ -154,7 +153,6 @@ class Node:
         acts.append(SetTimer(("rtx", msg_id), rto0))
 
     def _settle(self, acts, msg_id):
-        """Mensagem confirmada: deixa de estar pendente e cancela o temporizador."""
         p = self.pending.pop(msg_id, None)
         if p is not None:
             acts.append(CancelTimer(("rtx", msg_id)))
@@ -162,7 +160,6 @@ class Node:
 
     # ------------------------------------------------------------ eventos
     def start(self, now):
-        """Arranque (ou rearranque): um unico REGISTER ao bootstrapper."""
         acts = []
         self.state = REGISTERING
         mid = self._new_id()
@@ -180,6 +177,9 @@ class Node:
                 wire.T_NEIGHBOURS: self._on_neighbours,
                 wire.T_HELLO: self._on_hello,
                 wire.T_ACK: self._on_ack,
+                wire.T_ADVERT: self._on_advert,
+                wire.T_ACTIVATE: self._on_activate,
+                wire.T_DEACTIVATE: self._on_deactivate,
             }.get(tipo)
             if handler is None:
                 acts.append(Log(f"ignorei {wire.nome_do_tipo(tipo)} de {src[0]} (ainda nao implementado)"))
@@ -195,13 +195,15 @@ class Node:
             self._on_rtx(acts, key[1])
         elif key[0] == "tick":
             self._on_tick(acts, now)
+        elif key[0] == "advert":
+            self._on_advert_timer(acts, now)
         return acts
 
     # ------------------------------------------------------------ retransmissao
     def _on_rtx(self, acts, mid):
         p = self.pending.get(mid)
         if p is None:
-            return                              # entretanto confirmada
+            return
         if p.tries >= p.max_tries:
             del self.pending[mid]
             if p.kind == "REGISTER":
@@ -218,12 +220,10 @@ class Node:
         acts.append(SetTimer(("rtx", mid), p.rto))
         acts.append(Log(f"retransmito {p.kind} #{p.tries} (proximo timeout {p.rto:.1f}s)"))
 
-    # ------------------------------------------------------------ handlers
+    # ------------------------------------------------------------ handlers Marco 1
     def _on_neighbours(self, acts, now, src, mid, payload):
-        """Resposta do bootstrapper. O msg_id repetido do REGISTER serve de confirmacao,
-        por isso nao ha ACK de volta (o bootstrapper nao guarda estado)."""
         if self._settle(acts, mid) is None or self.state != REGISTERING:
-            return                              # duplicado ou fora de horas: idempotente
+            return
         entries = wire.dec_neighbours(payload)
         self.state = JOINED
         acts.append(Log(f"JOINED; vizinhos: " + (", ".join(f"{n}@{ip}" for n, ip, _ in entries) or "(nenhum)")))
@@ -232,7 +232,6 @@ class Node:
                             f"Tem de ser igual ao do cenario, maiusculas incluidas."))
         for nome, ip, porta in entries:
             if nome in self.vizinhos:
-                # ja o aprendemos por um HELLO dele: nao perder o estado, so fixar o endereco do bootstrapper
                 self.vizinhos[nome].addr = (ip, porta)
             else:
                 self.vizinhos[nome] = Vizinho(nome, (ip, porta))
@@ -240,69 +239,144 @@ class Node:
             data = wire.enc_name_msg(wire.T_HELLO, hid, self.name)
             self._send_reliable(acts, (ip, porta), hid, data,
                                 HELLO_RTO0, HELLO_RTO_MAX, HELLO_TRIES, "HELLO", peer=nome)
-        acts.append(SetTimer(("tick",), self.hello_interval))     # arranca a monitorizacao
+        acts.append(SetTimer(("tick",), self.hello_interval))
+        if any(r.local for r in self.rotas.values()):
+            acts.append(SetTimer(("advert",), self.advert_interval))
 
     def _on_hello(self, acts, now, src, mid, payload):
-        """Um vizinho diz quem e. Respondemos sempre com ACK (o ACK pode ter-se perdido
-        e o vizinho repetir o HELLO) e aprendemos o vizinho so da primeira vez."""
         nome = wire.dec_name_msg(payload)
         acts.append(Send(tuple(src), wire.enc_ack(mid)))
         v = self.vizinhos.get(nome)
         if v is None:
-            # vizinho que o bootstrapper nao nos indicou (ex.: no novo): aprendemo-lo aqui
             v = self.vizinhos[nome] = Vizinho(nome, tuple(src))
-        if not v.alive:
+        era_morto = not v.alive
+        if era_morto:
             voltou = v.last_heard is not None
             v.alive = True
             acts.append(Log(f"HELLO de {nome} ({src[0]}): vizinho {'voltou' if voltou else 'vivo'}"))
         v.last_heard = now
+        if era_morto:
+            self._enviar_rotas_conhecidas_a(acts, v)
 
     def _on_ack(self, acts, now, src, mid, payload):
         sonda = self.probes.pop(mid, None)
-        if sonda is not None:                   # ACK a um HELLO periodico
+        if sonda is not None:
             self._on_sonda_ack(acts, now, src, *sonda)
             return
         p = self._settle(acts, mid)
         if p is None:
-            return                              # ACK repetido
+            return
         if p.kind == "HELLO":
             v = self.vizinhos[p.peer]
-            if not v.alive:
+            era_morto = not v.alive
+            if era_morto:
                 v.alive = True
                 acts.append(Log(f"ACK de {p.peer} ({src[0]}): vizinho vivo ({p.tries} tentativa(s))"))
             v.last_heard = now
+            if era_morto:
+                self._enviar_rotas_conhecidas_a(acts, v)
+
+    # ------------------------------------------------------------ handlers Marco 2 (Flood e Rotas)
+    def _on_advert(self, acts, now, src, mid, payload):
+        """Recebe um anuncio de rota (ADVERT), atualiza a tabela e propaga se melhorou (Flood controlado)."""
+        stream, server, seq, cost = wire.dec_advert(payload)
+        v = self._vizinho_por_addr(src)
+        if v is None:
+            return
+        if not v.alive:
+            v.alive = True
+            acts.append(Log(f"ADVERT de {v.name} ({src[0]}): vizinho vivo"))
+        v.last_heard = now
+
+        melhorou = self.atualizar_rota(acts, stream, server, v.name, cost, seq, now=now)
+        if stream in self.desejadas:
+            self.pedir_stream(acts, stream)
+        if melhorou:
+            self._propagar_advert(acts, self.rotas[stream], exceto=v.name)
+
+    def _on_activate(self, acts, now, src, mid, payload):
+        """Recebe pedido de ativacao de um vizinho a jusante."""
+        stream = wire.dec_stream_msg(payload)
+        v = self._vizinho_por_addr(src)
+        if v is None:
+            return
+        v.last_heard = now
+        self.adicionar_destino_rota(acts, stream, v.name)
+
+    def _on_deactivate(self, acts, now, src, mid, payload):
+        """Recebe cancelamento de stream de um vizinho a jusante."""
+        stream = wire.dec_stream_msg(payload)
+        v = self._vizinho_por_addr(src)
+        if v is None:
+            return
+        v.last_heard = now
+        self.remover_destino_rota(acts, stream, v.name)
+
+    def _on_advert_timer(self, acts, now):
+        """Disparo periodico no Servidor: incrementa seq e inunda ADVERT de todas as streams locais."""
+        locais = [r for r in self.rotas.values() if r.local]
+        if not locais:
+            return
+        acts.append(SetTimer(("advert",), self.advert_interval))
+        for r in locais:
+            r.seq = ((r.seq or 0) + 1) & 0xFFFF
+            if r.seq == 0:
+                r.seq = 1
+            r.last_updated = now
+            self._propagar_advert(acts, r, exceto=None)
+
+    def _propagar_advert(self, acts, r, exceto=None):
+        """Inundacao controlada: envia ADVERT com o custo deste no a todos os vizinhos vivos,
+        exceto ao que nos enviou o anuncio (`exceto`) e ao proprio servidor da stream."""
+        if not r.tem_montante or r.seq is None or r.custo == float("inf"):
+            return
+        for v in self.vizinhos.values():
+            if not v.alive or v.name == exceto or v.name == r.server:
+                continue
+            mid = self._new_id()
+            self._send(acts, v.addr, wire.enc_advert(mid, r.stream, r.server, r.seq, r.custo))
+
+    def _enviar_rotas_conhecidas_a(self, acts, v):
+        """Quando um vizinho fica vivo, envia-lhe imediatamente as rotas validas conhecidas."""
+        for r in self.rotas.values():
+            if not r.tem_montante or r.custo == float("inf") or v.name == r.origem or v.name == r.server:
+                continue
+            if r.local and (r.seq is None or r.seq == 0):
+                r.seq = 1
+            if r.seq is not None:
+                mid = self._new_id()
+                self._send(acts, v.addr, wire.enc_advert(mid, r.stream, r.server, r.seq, r.custo))
 
     # ------------------------------------------------------------ monitorizacao dos vizinhos
     def _on_tick(self, acts, now):
-        """A cada HELLO_INTERVAL: (1) detetar vizinhos calados, (2) expirar rotas antigas, (3) sondar."""
         acts.append(SetTimer(("tick",), self.hello_interval))
         self.probes = {m: pr for m, pr in self.probes.items() if now - pr[1] < self.dead_after}
         for v in self.vizinhos.values():
             if v.alive and v.last_heard is not None and now - v.last_heard > self.dead_after:
                 self._vizinho_caiu(acts, now, v)
             if any(p.kind == "HELLO" and p.peer == v.name for p in self.pending.values()):
-                continue                        # o HELLO fiavel de arranque ainda esta em curso
+                continue
             mid = self._new_id()
             self.probes[mid] = (v.name, now)
             self._send(acts, v.addr, wire.enc_name_msg(wire.T_HELLO, mid, self.name))
         self._expirar_rotas(acts, now)
 
     def _on_sonda_ack(self, acts, now, src, nome, t_envio):
-        """ACK a um HELLO periodico: prova de vida e amostra limpa de RTT (um unico envio, sem
-        retransmissoes, por isso sem ambiguidade; o HELLO de arranque nao serve para isto)."""
         v = self.vizinhos.get(nome)
         if v is None:
             return
         v.rtt = now - t_envio
         v.srtt = v.rtt if v.srtt is None else (1 - RTT_ALPHA) * v.srtt + RTT_ALPHA * v.rtt
-        if not v.alive:
+        era_morto = not v.alive
+        if era_morto:
             voltou = v.last_heard is not None
             v.alive = True
             acts.append(Log(f"ACK de {nome} ({src[0]}): vizinho {'voltou' if voltou else 'vivo'}"))
         v.last_heard = now
+        if era_morto:
+            self._enviar_rotas_conhecidas_a(acts, v)
 
     def _vizinho_caiu(self, acts, now, v):
-        """Um vizinho deixou de dar sinal. Invalida/recalcula rotas que dependiam dele."""
         acts.append(Log(f"vizinho {v.name} CAIU (sem sinal ha {now - v.last_heard:.1f}s)"))
         v.alive = False
         v.rtt = v.srtt = None
@@ -310,12 +384,9 @@ class Node:
 
     # ------------------------------------------------------------ tabela de rotas
     def custo_ligacao(self, nome_vizinho):
-        """Metrica da ligacao ate ao vizinho.
-        Usa 1.0 (contagem de saltos) por omissao, ou podera usar v.srtt quando quiserem."""
         return 1.0
 
     def _enviar_controlo_rota(self, acts, tipo, nome_vizinho, stream):
-        """Envia ACTIVATE ou DEACTIVATE ao vizinho indicado (se existir e nao for local)."""
         if nome_vizinho is None:
             return
         v = self.vizinhos.get(nome_vizinho)
@@ -325,7 +396,6 @@ class Node:
         self._send(acts, v.addr, wire.enc_stream_msg(tipo, mid, stream))
 
     def registar_stream_local(self, stream):
-        """Usado no Servidor para registar na tabela uma stream que ele proprio gera."""
         r = self.rotas.get(stream)
         if r is None:
             r = self.rotas[stream] = Rota(stream, self.name, None, 0.0, 0, local=True)
@@ -337,19 +407,19 @@ class Node:
         return r
 
     def pedir_stream(self, acts, stream):
-        """Usado no Cliente quando quer comecar a assistir a uma stream."""
+        self.desejadas.add(stream)
         r = self.rotas.get(stream)
-        if r is None:
+        if r is None or not r.tem_montante:
             return False
         estava_ativa = r.ativa
         r.consumo_local = True
         if not estava_ativa and r.ativa and not r.local:
-            acts.append(Log(f"rota {stream} passou a ATIVA (consumo local)"))
+            acts.append(Log(f"rota {stream} passou a ATIVA (consumo local via {r.origem})"))
             self._enviar_controlo_rota(acts, wire.T_ACTIVATE, r.origem, stream)
         return not estava_ativa and r.ativa
 
     def deixar_stream(self, acts, stream):
-        """Usado no Cliente quando deixa de assistir a uma stream."""
+        self.desejadas.discard(stream)
         r = self.rotas.get(stream)
         if r is None or not r.consumo_local:
             return False
@@ -361,10 +431,7 @@ class Node:
         return estava_ativa and not r.ativa
 
     def atualizar_rota(self, acts, stream, server, vizinho_origem, custo_anunciado, seq, now=0.0):
-        """Avalia um anuncio de rota recebido de `vizinho_origem`.
-        Devolve True se a rota principal melhorou/mudou (sinal para fazer flood a seguir!)
-        ou False se foi ignorada ou guardada apenas como alternativa."""
-        if vizinho_origem not in self.vizinhos or server == self.name:
+        if vizinho_origem not in self.vizinhos or server == self.name or custo_anunciado == float("inf"):
             return False
 
         novo_custo = custo_anunciado + self.custo_ligacao(vizinho_origem)
@@ -379,17 +446,14 @@ class Node:
         if r.local:
             return False
 
-        # Se a rota tinha expirado (r.seq is None), qualquer seq e aceite como novo
         seq_novo = r.seq is None or _seq_mais_recente(seq, r.seq)
         seq_igual = r.seq is not None and seq == r.seq
 
-        # Ignorar anuncios antigos
         if not seq_novo and not seq_igual:
             return False
 
         # Caso 2: Nova ronda de anuncio do servidor (seq mais recente)
         if seq_novo:
-            # Evitar troca de origem precipitada se um caminho pior chegar primeiro nesta ronda
             if not (vizinho_origem == r.origem or r.origem is None or novo_custo < r.custo):
                 r.alternativas[vizinho_origem] = (novo_custo, seq)
                 return False
@@ -421,7 +485,6 @@ class Node:
                 return True
             return False
 
-        # Se o novo caminho for estritamente melhor que a origem atual, promovemos!
         if r.origem is None or novo_custo < r.custo:
             origem_antiga = r.origem
             tinha_jusante = r.tem_jusante
@@ -445,7 +508,6 @@ class Node:
         return False
 
     def adicionar_destino_rota(self, acts, stream, vizinho_destino):
-        """Um vizinho a jusante pediu para receber a stream (ACTIVATE)."""
         r = self.rotas.get(stream)
         if r is None:
             return False
@@ -456,10 +518,11 @@ class Node:
             acts.append(Log(f"rota {stream} passou a ATIVA -> destinos: {sorted(r.destinos)}"))
             if not r.local:
                 self._enviar_controlo_rota(acts, wire.T_ACTIVATE, r.origem, stream)
+        else:
+            acts.append(Log(f"rota {stream} adicionou destino {vizinho_destino} -> destinos: {sorted(r.destinos)}"))
         return ativou_agora
 
     def remover_destino_rota(self, acts, stream, vizinho_destino):
-        """Um vizinho a jusante deixou de querer a stream (DEACTIVATE ou caiu)."""
         r = self.rotas.get(stream)
         if r is None or vizinho_destino not in r.destinos:
             return False
@@ -473,7 +536,6 @@ class Node:
         return desativou_agora
 
     def _remover_vizinho_das_rotas(self, acts, nome_viz):
-        """Limpa um vizinho caido das tabelas e ativa rotas alternativas se existirem."""
         for r in self.rotas.values():
             r.alternativas.pop(nome_viz, None)
             if nome_viz in r.destinos:
@@ -494,7 +556,6 @@ class Node:
                     acts.append(Log(f"rota {r.stream} perdeu a origem {nome_viz} e nao tem alternativas!"))
 
     def _expirar_rotas(self, acts, now):
-        """Se uma rota nao recebe ADVERT ha demasiado tempo, limpa o seq para aceitar reinicios do servidor."""
         if self.route_stale_after is None:
             return
         for r in self.rotas.values():
@@ -508,11 +569,10 @@ class Node:
 
 class Bootstrapper:
     """Servidor de arranque, SEM ESTADO por no: so le uma tabela estatica (nome -> vizinhos)
-    e responde a cada REGISTER. Nao envia nada por iniciativa propria, nao guarda quem
-    se registou, nao participa no overlay."""
+    e responde a cada REGISTER."""
 
     def __init__(self, tabela):
-        self.tabela = tabela        # {nome: [(nome_viz, ip, porta), ...]}
+        self.tabela = tabela
 
     def start(self, now):
         return [Log(f"bootstrapper pronto; conhece {len(self.tabela)} no(s)")]
