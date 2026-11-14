@@ -71,7 +71,12 @@ class Sim:
             logic = self.logic[BOOT] = self._boot
         else:
             self._cancel_all(nome)
-            logic = self.logic[nome] = core.Node(nome, self.topo.boot_addr)
+            info = self.topo.nodes[nome]
+            logic = self.logic[nome] = core.Node(
+                nome, self.topo.boot_addr,
+                streams=info.get("streams", ()),
+                watch=info.get("watch", ()),
+            )
         self._exec(nome, logic.start(self.now))
 
     def _ev_kill(self, nome):
