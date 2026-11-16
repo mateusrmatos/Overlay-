@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""ott - overlay OTT (TP2 ESR). Marco 1: arranque com bootstrapper + HELLO.
+"""ott - overlay OTT (TP2 ESR). Marco 1 & 2: bootstrapper + HELLO + Flood de Rotas (ADVERT/ACTIVATE).
 
   Bootstrapper (no B da rede de gestao):
       python3 ott.py bootstrap --topology cenarios/cenario1.json [--port 9000] [--trace]
 
-  Um no (S1, N1, C1, ... ):
-      python3 ott.py node --name N1 --boot 172.16.0.254:9000 [--port 5000] [--trace]
+  Um no Servidor (ex. S1 a servir video1):
+      python3 ott.py node --name S1 --boot 172.16.0.254:9000 --serve video1 [--trace]
+
+  Um no Intermedio (ex. N1):
+      python3 ott.py node --name N1 --boot 172.16.0.254:9000 [--trace]
+
+  Um no Cliente (ex. C1 a assistir a video1):
+      python3 ott.py node --name C1 --boot 172.16.0.254:9000 --watch video1 [--trace]
 
   Simulacao em tempo virtual (sem rede, sem CORE):
-      python3 ott.py sim --topology cenarios/cenario1.json [--spread 0.5] [--loss-gestao 0.3]
-      python3 ott.py sim --topology cenarios/cenario1.json --kill N1 --kill-at 10 --restart-at 25 --ate 40
+      python3 ott.py sim --topology cenarios/cenario1.json --serve S1:video1 --watch C1:video1 --watch C2:video1
 """
 import argparse
 import asyncio
@@ -24,8 +29,6 @@ from ottlib.topology import Topology        # noqa: E402
 
 
 def parse_addr(s):
-    """'IP:porta' (porta opcional, 9000 por omissao). Valida, para apanhar erros como
-    '172.16.0.254.9000:9000' (ponto em vez de dois pontos)."""
     ip, _, port = s.partition(":")
     try:
         ipaddress.IPv4Address(ip)
@@ -38,12 +41,19 @@ def parse_addr(s):
 
 
 def node_name(s):
-    """Nome de no valido para o protocolo (1 a 31 caracteres ASCII)."""
     try:
         wire.enc_name_msg(wire.T_REGISTER, 0, s)
     except wire.WireError:
         raise argparse.ArgumentTypeError(f"nome invalido {s!r}: use 1 a 31 caracteres ASCII, ex. N1")
     return s
+
+
+def parse_node_stream(s):
+    """Formato NO:STREAM (ex. S1:video1 ou C1:video1) para o simulador."""
+    no, sep, stream = s.partition(":")
+    if not sep:
+        raise argparse.ArgumentTypeError(f"formato invalido {s!r}: use NO:STREAM, ex. S1:video1")
+    return node_name(no), node_name(stream)
 
 
 def cmd_bootstrap(a):
@@ -54,12 +64,18 @@ def cmd_bootstrap(a):
 
 
 def cmd_node(a):
-    logic = core.Node(a.name, a.boot)
+    logic = core.Node(a.name, a.boot, streams=a.serve, watch=a.watch)
     asyncio.run(runtime.serve(logic, a.name, a.bind, a.port, a.trace))
 
 
 def cmd_sim(a):
     topo = Topology.load(a.topology)
+    for no, stream in a.serve:
+        if no in topo.nodes:
+            topo.nodes[no].setdefault("streams", []).append(stream)
+    for no, stream in a.watch:
+        if no in topo.nodes:
+            topo.nodes[no].setdefault("watch", []).append(stream)
     s = Sim(topo, seed=a.seed, mgmt_loss=a.loss_gestao, verbose=True)
     s.start_all(spread=a.spread)
     if a.kill:
@@ -87,6 +103,10 @@ def main():
     n.add_argument("--boot", required=True, type=parse_addr, help="IP:porta do bootstrapper")
     n.add_argument("--port", type=int, default=5000)
     n.add_argument("--bind", default="0.0.0.0", help="so para testes locais (loopback)")
+    n.add_argument("--serve", action="append", default=[], type=node_name,
+                   help="nome de stream local que este servidor disponibiliza (pode repetir-se)")
+    n.add_argument("--watch", action="append", default=[], type=node_name,
+                   help="nome de stream que este cliente quer consumir (pode repetir-se)")
     n.add_argument("--trace", action="store_true")
     n.set_defaults(fn=cmd_node)
 
@@ -96,6 +116,10 @@ def main():
     s.add_argument("--loss-gestao", type=float, default=0.0)
     s.add_argument("--seed", type=int, default=1)
     s.add_argument("--ate", type=float, default=15.0)
+    s.add_argument("--serve", action="append", default=[], type=parse_node_stream,
+                   help="NO:STREAM que um servidor anuncia (ex. --serve S1:video1)")
+    s.add_argument("--watch", action="append", default=[], type=parse_node_stream,
+                   help="NO:STREAM que um cliente pede (ex. --watch C1:video1)")
     s.add_argument("--kill", metavar="NO", help="mata este no durante a simulacao")
     s.add_argument("--kill-at", type=float, default=10.0, help="instante da morte (s)")
     s.add_argument("--restart-at", type=float, default=None, help="instante em que o no ressuscita (s)")
