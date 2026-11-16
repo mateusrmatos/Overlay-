@@ -1,6 +1,6 @@
-"""Formato das mensagens (binario, big-endian) - Marco 1 & 2.
+"""Formato das mensagens (binario, big-endian) - Marco 1, 2 & Dados.
 
-Cada datagrama UDP de controlo comeca por um cabecalho de 4 bytes:
+Cada datagrama UDP comeca por um cabecalho de 4 bytes:
 
     +---------+--------+---------------+
     | versao  | tipo   | msg_id        |
@@ -27,7 +27,7 @@ T_NEIGHBOURS = 2   # bootstrapper -> no:  lista de vizinhos (nome, ip, porta)
 T_HELLO = 3        # no -> vizinho:       "sou o N1" (fiavel: espera ACK)
 T_ACK = 4          # confirmacao de uma mensagem fiavel
 
-# --- tipos usados no Marco 2 (Rotas) e seguintes
+# --- tipos usados no Marco 2 (Rotas) e Dados
 T_ADVERT = 5       # anuncio de rota (stream, servidor, seq, metrica)
 T_QUERY = 6
 T_REPLY = 7
@@ -35,7 +35,7 @@ T_ACTIVATE = 8     # pedido de ativacao de fluxo (downstream -> upstream)
 T_DEACTIVATE = 9   # cancelamento de fluxo (downstream -> upstream)
 T_PROBE = 10
 T_ECHO = 11
-T_DATA = 12
+T_DATA = 12        # pacote de dados/video (upstream -> downstream pelas rotas ativas)
 
 NOMES = {
     T_REGISTER: "REGISTER", T_NEIGHBOURS: "NEIGHBOURS", T_HELLO: "HELLO", T_ACK: "ACK",
@@ -46,7 +46,8 @@ NOMES = {
 HDR = struct.Struct("!BBH")
 _ENTRY_TAIL = struct.Struct("!4sH")    # ip (4 bytes) + porta (2 bytes)
 _ADVERT_TAIL = struct.Struct("!HI")    # seq (2 bytes) + custo escalado (4 bytes)
-_COST_SCALE = 1000                     # milissegundos / milésimas de unidade
+_DATA_SEQ = struct.Struct("!I")        # frame_seq (4 bytes sem sinal)
+_COST_SCALE = 1000                     # milissegundos / milesimas de unidade
 _COST_INF = 0xFFFFFFFF                 # valor reservado para float("inf")
 
 
@@ -171,3 +172,24 @@ def enc_stream_msg(tipo, msg_id, stream):
 
 def dec_stream_msg(payload):
     return dec_name_msg(payload)
+
+
+# ---------------------------------------------------------------- DATA (Transporte de Fluxos)
+def enc_data(msg_id, stream, frame_seq, data_bytes=b""):
+    """Pacote de dados multimédia: nome da stream, num de frame (32 bits) e payload."""
+    if not isinstance(data_bytes, (bytes, bytearray, memoryview)):
+        raise WireError("payload de DATA tem de ser bytes")
+    if frame_seq < 0:
+        raise WireError(f"frame_seq invalido: {frame_seq}")
+    body = _pack_name(stream) + _DATA_SEQ.pack(frame_seq & 0xFFFFFFFF) + bytes(data_bytes)
+    return encode(T_DATA, msg_id, body)
+
+
+def dec_data(payload):
+    """Devolve (stream, frame_seq, data_bytes)."""
+    stream, off = _unpack_name(payload, 0)
+    if off + _DATA_SEQ.size > len(payload):
+        raise WireError("DATA truncado (sem frame_seq)")
+    (frame_seq,) = _DATA_SEQ.unpack_from(payload, off)
+    off += _DATA_SEQ.size
+    return stream, frame_seq, payload[off:]

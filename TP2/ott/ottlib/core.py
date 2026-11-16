@@ -1,4 +1,4 @@
-"""Nucleo do protocolo (sans-I/O) - Marco 1 & 2 (Flood + Rotas).
+"""Nucleo do protocolo (sans-I/O) - Marco 1, 2 & Encaminhamento de Dados.
 
 Ideia central: este modulo NAO abre sockets, NAO dorme, NAO le o relogio.
 Recebe EVENTOS (arrancar, chegou um pacote, expirou um temporizador) e devolve ACOES
@@ -27,6 +27,9 @@ RTT_ALPHA = 0.125
 # Flood periodico de rotas (Servidor -> Rede) e tempo de expiracao (3 periodos)
 ADVERT_INTERVAL = 2.0
 ROUTE_STALE_AFTER = 6.0
+
+# Intervalo de emissao de pacotes DATA de teste quando uma stream local esta ATIVA
+DATA_INTERVAL = 1.0
 
 # estados do no
 INIT, REGISTERING, JOINED, ORPHAN = "INIT", "REGISTERING", "JOINED", "ORPHAN"
@@ -62,10 +65,11 @@ class Vizinho:
 
 class Rota:
     """Entrada na tabela de encaminhamento para um fluxo (stream).
-    Mantem a rota principal (origem, custo) e caminhos alternativos conhecidos."""
+    Mantem a rota principal (origem, custo), caminhos alternativos e contadores de dados."""
     __slots__ = (
         "stream", "server", "origem", "custo", "seq", "last_updated",
         "destinos", "alternativas", "local", "consumo_local",
+        "frames_enviadas", "frames_recebidas", "ultima_frame",
     )
 
     def __init__(self, stream, server, origem, custo, seq, now=0.0, local=False):
@@ -79,6 +83,9 @@ class Rota:
         self.alternativas = {}
         self.local = local
         self.consumo_local = False
+        self.frames_enviadas = 0
+        self.frames_recebidas = 0
+        self.ultima_frame = None
 
     @property
     def tem_montante(self):
@@ -108,18 +115,19 @@ class Rota:
 class Node:
     def __init__(self, name, boot_addr, hello_interval=HELLO_INTERVAL, dead_after=HELLO_DEAD_AFTER,
                  advert_interval=ADVERT_INTERVAL, route_stale_after=ROUTE_STALE_AFTER,
-                 streams=(), watch=()):
+                 data_interval=DATA_INTERVAL, streams=(), watch=()):
         self.name = name
         self.boot_addr = tuple(boot_addr)
         self.hello_interval, self.dead_after = hello_interval, dead_after
         self.advert_interval = advert_interval
         self.route_stale_after = route_stale_after
+        self.data_interval = data_interval
         self.state = INIT
         self.vizinhos = {}        # nome -> Vizinho
         self.rotas = {}           # stream -> Rota (Tabela de Rotas)
         self.pending = {}         # msg_id -> Pending (mensagens fiaveis)
         self.probes = {}          # msg_id -> (nome, t_envio): HELLO periodico
-        self. desejadas = set(watch)  # streams que este no (cliente) quer consumir
+        self.desejadas = set(watch)  # streams que este no (cliente) quer consumir
         self._next_id = 1
         for s in streams:
             self.registar_stream_local(s)
@@ -180,6 +188,7 @@ class Node:
                 wire.T_ADVERT: self._on_advert,
                 wire.T_ACTIVATE: self._on_activate,
                 wire.T_DEACTIVATE: self._on_deactivate,
+                wire.T_DATA: self._on_data,
             }.get(tipo)
             if handler is None:
                 acts.append(Log(f"ignorei {wire.nome_do_tipo(tipo)} de {src[0]} (ainda nao implementado)"))
@@ -197,6 +206,8 @@ class Node:
             self._on_tick(acts, now)
         elif key[0] == "advert":
             self._on_advert_timer(acts, now)
+        elif key[0] == "data":
+            self._on_data_timer(acts, now)
         return acts
 
     # ------------------------------------------------------------ retransmissao
@@ -242,6 +253,8 @@ class Node:
         acts.append(SetTimer(("tick",), self.hello_interval))
         if any(r.local for r in self.rotas.values()):
             acts.append(SetTimer(("advert",), self.advert_interval))
+            if self.data_interval:
+                acts.append(SetTimer(("data",), self.data_interval))
 
     def _on_hello(self, acts, now, src, mid, payload):
         nome = wire.dec_name_msg(payload)
@@ -346,6 +359,69 @@ class Node:
             if r.seq is not None:
                 mid = self._new_id()
                 self._send(acts, v.addr, wire.enc_advert(mid, r.stream, r.server, r.seq, r.custo))
+
+    # ------------------------------------------------------------ Plano de Dados (T_DATA)
+    def _on_data_timer(self, acts, now):
+        """Emite pacotes DATA periodicos apenas para as streams locais que estejam ATIVAS."""
+        locais = [r for r in self.rotas.values() if r.local]
+        if not locais or not self.data_interval:
+            return
+        acts.append(SetTimer(("data",), self.data_interval))
+        for r in locais:
+            if r.ativa:
+                self.enviar_dados(acts, r.stream)
+
+    def enviar_dados(self, acts, stream, payload=None):
+        """Envia um pacote de dados da stream local para todos os destinos ativos.
+        Devolve True se enviou/entregou, ou False se a rota estiver inativa."""
+        r = self.rotas.get(stream)
+        if r is None or not r.local or not r.ativa:
+            return False
+        r.frames_enviadas += 1
+        frame_seq = r.frames_enviadas
+        if payload is None:
+            payload = f"{self.name}:{stream}:frame={frame_seq}".encode("ascii")
+        for dst_nome in sorted(r.destinos):
+            v = self.vizinhos.get(dst_nome)
+            if v is not None and v.alive:
+                mid = self._new_id()
+                self._send(acts, v.addr, wire.enc_data(mid, stream, frame_seq, payload))
+        if r.consumo_local:
+            r.frames_recebidas += 1
+            r.ultima_frame = frame_seq
+        return True
+
+    def _on_data(self, acts, now, src, mid, payload):
+        """Recebe um pacote T_DATA, valida a origem (RPF) e replica para os destinos ativos."""
+        stream, frame_seq, body = wire.dec_data(payload)
+        v = self._vizinho_por_addr(src)
+        if v is None:
+            return
+        v.last_heard = now
+        r = self.rotas.get(stream)
+
+        # Se nao temos rota ativa ou o pacote veio de quem nao e a nossa origem atual:
+        # descartamos e enviamos DEACTIVATE para cortar o ramo desnecessario a montante.
+        if r is None or r.local or not r.ativa or v.name != r.origem:
+            self._enviar_controlo_rota(acts, wire.T_DEACTIVATE, v.name, stream)
+            return
+
+        r.frames_recebidas += 1
+        r.ultima_frame = frame_seq
+
+        # Reencaminhamento Multicast para todos os vizinhos a jusante que pediram a stream
+        for dst_nome in sorted(r.destinos):
+            if dst_nome == v.name:
+                continue
+            viz_dst = self.vizinhos.get(dst_nome)
+            if viz_dst is not None and viz_dst.alive:
+                f_mid = self._new_id()
+                self._send(acts, viz_dst.addr, wire.enc_data(f_mid, stream, frame_seq, body))
+
+        # Entrega ao cliente local
+        if r.consumo_local:
+            acts.append(Log(f"DATA [{stream}] frame #{frame_seq} recebida via {v.name} "
+                            f"({len(body)}B, total={r.frames_recebidas})"))
 
     # ------------------------------------------------------------ monitorizacao dos vizinhos
     def _on_tick(self, acts, now):
