@@ -103,14 +103,29 @@ class TestArranque(unittest.TestCase):
         self.assertEqual(vizinhos_vivos(s, "N1"), {"S1", "C1", "C2"})
         self.assertEqual(vizinhos_vivos(s, "C2"), {"N1"})
 
-    def test_gestao_com_40pc_de_perda_ainda_entra(self):
+    def test_gestao_com_20pc_de_perda_todos_entram(self):
+        """Com 20 % de perda por sentido, esgotar as 10 tentativas tem probabilidade ~4e-5 por no."""
+        for seed in range(1, 41):
+            t = topo(1)
+            s = Sim(t, seed=seed, mgmt_loss=0.2)
+            s.start_all(spread=0.2)
+            s.run(60)
+            for nome in t.nodes:
+                self.assertEqual(s.logic[nome].state, core.JOINED, f"seed {seed} {nome}")
+
+    def test_gestao_com_40pc_de_perda_quase_todos_entram(self):
+        """Com 40 % de perda por sentido, uma volta REGISTER+NEIGHBOURS so tem sucesso em 0.6*0.6 = 36 %
+        das vezes; falhar as 10 tentativas tem probabilidade 0.64**10 ~ 1.2 % por no. Em 80 arranques
+        esperamos cerca de 1 falha, por isso o teste exige poucas falhas e nao zero (exigir zero era
+        instavel: passava ou nao conforme a sequencia pseudo-aleatoria)."""
+        falhas = 0
         for seed in range(1, 21):
             t = topo(1)
             s = Sim(t, seed=seed, mgmt_loss=0.4)
             s.start_all(spread=0.2)
             s.run(60)
-            for nome in t.nodes:
-                self.assertEqual(s.logic[nome].state, core.JOINED, f"seed {seed} {nome}")
+            falhas += sum(1 for n in t.nodes if s.logic[n].state != core.JOINED)
+        self.assertLessEqual(falhas, 5, f"{falhas} nos orfaos em 80 arranques (esperado ~1)")
 
     def test_overlay_com_30pc_de_perda_ainda_se_conhece(self):
         falhas = 0
