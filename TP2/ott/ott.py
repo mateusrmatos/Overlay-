@@ -19,6 +19,7 @@
 import argparse
 import asyncio
 import ipaddress
+import json
 import os
 import sys
 
@@ -64,7 +65,8 @@ def cmd_bootstrap(a):
 
 
 def cmd_node(a):
-    logic = core.Node(a.name, a.boot, streams=a.serve, watch=a.watch)
+    logic = core.Node(a.name, a.boot, streams=a.serve, watch=a.watch,
+                      keepalive_dados=a.keepalive, data_interval=a.data_interval)
     asyncio.run(runtime.serve(logic, a.name, a.bind, a.port, a.trace))
 
 
@@ -76,15 +78,28 @@ def cmd_sim(a):
     for no, stream in a.watch:
         if no in topo.nodes:
             topo.nodes[no].setdefault("watch", []).append(stream)
-    s = Sim(topo, seed=a.seed, mgmt_loss=a.loss_gestao, verbose=True)
+    s = Sim(topo, seed=a.seed, mgmt_loss=a.loss_gestao, verbose=True,
+            node_opts={"keepalive_dados": a.keepalive, "data_interval": a.data_interval})
     s.start_all(spread=a.spread)
     if a.kill:
         s.kill(a.kill, a.kill_at)
         if a.restart_at is not None:
             s.restart(a.kill, a.restart_at)
     s.run(a.ate)
-    print("\n--- trace de pacotes ---")
-    print(s.formata_trace())
+    if not a.sem_trace:
+        print("\n--- trace de pacotes ---")
+        print(s.formata_trace())
+
+
+def cmd_importar_core(a):
+    from ottlib.importar import importar, le_arestas
+    d = importar(a.xml, le_arestas(a.overlay), base_ms=a.base_ms)
+    with open(a.out, "w", encoding="utf-8") as f:
+        json.dump(d, f, indent=2)
+    print(f"{a.out}: {len(d['nodes'])} nos overlay, {len(d['links'])} ligacoes, "
+          f"bootstrapper em {d['boot']['addr']}:{d['boot']['port']}")
+    for l in d["links"]:
+        print(f"  {l['a']:>3}-{l['b']:<3} {l['delay_ms']:6.1f} ms   via {' > '.join(l['via'])}")
 
 
 def main():
@@ -108,6 +123,10 @@ def main():
     n.add_argument("--watch", action="append", default=[], type=node_name,
                    help="nome de stream que este cliente quer consumir (pode repetir-se)")
     n.add_argument("--trace", action="store_true")
+    n.add_argument("--keepalive", action="store_true",
+                   help="extra: os dados fazem de keepalive nas arestas ativas (menos HELLO, falha detetada mais depressa)")
+    n.add_argument("--data-interval", type=float, default=1.0,
+                   help="servidor: intervalo entre pacotes DATA de teste (s)")
     n.set_defaults(fn=cmd_node)
 
     s = sub.add_parser("sim")
@@ -123,7 +142,18 @@ def main():
     s.add_argument("--kill", metavar="NO", help="mata este no durante a simulacao")
     s.add_argument("--kill-at", type=float, default=10.0, help="instante da morte (s)")
     s.add_argument("--restart-at", type=float, default=None, help="instante em que o no ressuscita (s)")
+    s.add_argument("--keepalive", action="store_true", help="liga o extra dados-como-keepalive")
+    s.add_argument("--data-interval", type=float, default=1.0, help="intervalo entre DATA (s)")
+    s.add_argument("--sem-trace", action="store_true", help="nao imprime o trace de pacotes")
     s.set_defaults(fn=cmd_sim)
+
+    i = sub.add_parser("importar-core", help="gera a topologia JSON a partir de um XML exportado do CORE")
+    i.add_argument("--xml", required=True)
+    i.add_argument("--overlay", required=True, help="ficheiro de arestas do overlay (A-B por linha)")
+    i.add_argument("--out", required=True)
+    i.add_argument("--base-ms", type=float, default=1.0,
+                   help="atraso assumido por ligacao do underlay sem netem (ms)")
+    i.set_defaults(fn=cmd_importar_core)
 
     a = p.parse_args()
     try:
