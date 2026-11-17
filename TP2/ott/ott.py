@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
-"""ott - overlay OTT (TP2 ESR). Marco 1 & 2: bootstrapper + HELLO + Flood de Rotas (ADVERT/ACTIVATE).
+"""ott - overlay OTT (TP2 ESR). Marco 1, 2 & Video Streaming (T_DATA).
 
   Bootstrapper (no B da rede de gestao):
-      python3 ott.py bootstrap --topology cenarios/cenario1.json [--port 9000] [--trace]
+      python3 ott.py bootstrap --topology cenarios/cenario2.json [--port 9000] [--trace]
 
-  Um no Servidor (ex. S1 a servir video1):
+  Um no Servidor (com pacotes de teste automaticos 1/s):
       python3 ott.py node --name S1 --boot 172.16.0.254:9000 --serve video1 [--trace]
+
+  Um no Servidor (a receber video real do FFmpeg na porta UDP 8888):
+      python3 ott.py node --name S1 --boot 172.16.0.254:9000 --serve video1 --ingest-port 8888
 
   Um no Intermedio (ex. N1):
       python3 ott.py node --name N1 --boot 172.16.0.254:9000 [--trace]
 
-  Um no Cliente (ex. C1 a assistir a video1):
-      python3 ott.py node --name C1 --boot 172.16.0.254:9000 --watch video1 [--trace]
+  Um no Cliente (a entregar video real ao FFplay/VLC na porta UDP 9999):
+      python3 ott.py node --name C1 --boot 172.16.0.254:9000 --watch video1 --player-port 9999
 
   Simulacao em tempo virtual (sem rede, sem CORE):
-      python3 ott.py sim --topology cenarios/cenario1.json --serve S1:video1 --watch C1:video1 --watch C2:video1
+      python3 ott.py sim --topology cenarios/cenario2.json --serve S1:video1 --watch C1:video1 --watch C2:video1
 """
 import argparse
 import asyncio
 import ipaddress
 import os
+import socket
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -56,6 +60,47 @@ def parse_node_stream(s):
     return node_name(no), node_name(stream)
 
 
+class _IngestProtocol(asyncio.DatagramProtocol):
+    """Recebe datagramas de video do FFmpeg local (ex. 127.0.0.1:8888) e injeta no Node."""
+
+    def __init__(self, logic, stream_name, out_sock):
+        self.logic = logic
+        self.stream_name = stream_name
+        self.out_sock = out_sock
+
+    def datagram_received(self, data, addr):
+        acts = []
+        self.logic.enviar_dados(acts, self.stream_name, payload=data)
+        for a in acts:
+            if isinstance(a, core.Send):
+                try:
+                    self.out_sock.sendto(a.data, a.dst)
+                except OSError:
+                    pass
+
+
+async def _run_node(a, logic):
+    ingest_transport = None
+    out_sock = None
+    if a.ingest_port and a.serve:
+        loop = asyncio.get_running_loop()
+        out_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        stream_alvo = a.serve[0]
+        ingest_transport, _ = await loop.create_datagram_endpoint(
+            lambda: _IngestProtocol(logic, stream_alvo, out_sock),
+            local_addr=("127.0.0.1", a.ingest_port),
+        )
+        print(f"[{a.name}] Ingestao FFmpeg ativa em 127.0.0.1:{a.ingest_port} -> stream '{stream_alvo}'",
+              flush=True)
+    try:
+        await runtime.serve(logic, a.name, a.bind, a.port, a.trace)
+    finally:
+        if ingest_transport is not None:
+            ingest_transport.close()
+        if out_sock is not None:
+            out_sock.close()
+
+
 def cmd_bootstrap(a):
     topo = Topology.load(a.topology)
     logic = core.Bootstrapper(topo.tabela_vizinhos())
@@ -64,8 +109,20 @@ def cmd_bootstrap(a):
 
 
 def cmd_node(a):
-    logic = core.Node(a.name, a.boot, streams=a.serve, watch=a.watch)
-    asyncio.run(runtime.serve(logic, a.name, a.bind, a.port, a.trace))
+    player_addr = ("127.0.0.1", a.player_port) if a.player_port else None
+    # Se --ingest-port for usado no servidor, desativa os pacotes DATA falsos automaticos (data_interval=0)
+    data_interval = 0.0 if a.ingest_port else core.DATA_INTERVAL
+    logic = core.Node(
+        a.name,
+        a.boot,
+        streams=a.serve,
+        watch=a.watch,
+        data_interval=data_interval,
+        player_addr=player_addr,
+    )
+    if a.player_port and a.watch:
+        print(f"[{a.name}] Saida de video ativa para player local em 127.0.0.1:{a.player_port}", flush=True)
+    asyncio.run(_run_node(a, logic))
 
 
 def cmd_sim(a):
@@ -107,6 +164,10 @@ def main():
                    help="nome de stream local que este servidor disponibiliza (pode repetir-se)")
     n.add_argument("--watch", action="append", default=[], type=node_name,
                    help="nome de stream que este cliente quer consumir (pode repetir-se)")
+    n.add_argument("--ingest-port", type=int, default=0,
+                   help="porta UDP local onde o Servidor recebe video do FFmpeg (ex. 8888)")
+    n.add_argument("--player-port", type=int, default=0,
+                   help="porta UDP local para onde o Cliente envia o video recebido (ex. 9999)")
     n.add_argument("--trace", action="store_true")
     n.set_defaults(fn=cmd_node)
 
