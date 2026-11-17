@@ -20,7 +20,8 @@ BOOT = "BOOT"
 
 
 class Sim:
-    def __init__(self, topo, seed=1, mgmt_delay=0.001, mgmt_loss=0.0, verbose=False):
+    def __init__(self, topo, seed=1, mgmt_delay=0.001, mgmt_loss=0.0, verbose=False, node_opts=None):
+        self.node_opts = dict(node_opts or {})      # opcoes passadas a cada core.Node
         self.topo = topo if isinstance(topo, Topology) else Topology(topo)
         self.rng = random.Random(seed)
         self.now = 0.0
@@ -76,6 +77,7 @@ class Sim:
                 nome, self.topo.boot_addr,
                 streams=info.get("streams", ()),
                 watch=info.get("watch", ()),
+                **self.node_opts,
             )
         self._exec(nome, logic.start(self.now))
 

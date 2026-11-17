@@ -40,14 +40,14 @@ def instantes_dados(sim, cliente):
 
 
 def medir(topology, serve, watch, kill=None, kill_at=40.0, ate=None, janela=20.0, seed=1,
-          loss_gestao=0.0):
+          loss_gestao=0.0, node_opts=None):
     topo = Topology.load(topology) if isinstance(topology, str) else topology
     for no, st in serve:
         topo.nodes[no].setdefault("streams", []).append(st)
     for no, st in watch:
         topo.nodes[no].setdefault("watch", []).append(st)
     ate = ate if ate is not None else (kill_at + 30.0 if kill else 60.0)
-    s = Sim(topo, seed=seed, mgmt_loss=loss_gestao)
+    s = Sim(topo, seed=seed, mgmt_loss=loss_gestao, node_opts=node_opts)
     s.start_all(spread=0.1)
     if kill:
         s.kill(kill, kill_at)
@@ -74,16 +74,16 @@ def medir(topology, serve, watch, kill=None, kill_at=40.0, ate=None, janela=20.0
         ts = instantes_dados(s, no)
         c = {"primeiro_dado": round(ts[0], 2) if ts else None}
         if kill:
-            antes = [t for t in ts if t < kill_at]
-            depois = [t for t in ts if t >= kill_at]
+            # Pacotes que ja iam a caminho chegam ate ~0.3 s depois da morte: so contam como
+            # "recuperou" os que chegam depois disso. O buraco e o MAIOR intervalo entre dois
+            # dados consecutivos a partir da morte (nao o intervalo a volta do instante da morte).
             if no == kill:
                 c["failover"] = "(no morto)"
-            elif depois and antes:
-                c["failover"] = round(depois[0] - antes[-1], 2)       # intervalo sem dados
-            elif depois:
-                c["failover"] = 0.0
-            else:
+            elif not any(t > kill_at + 0.3 for t in ts):
                 c["failover"] = "SEM RECUPERACAO"
+            else:
+                janela_ts = [t for t in ts if t >= kill_at - 0.5]
+                c["failover"] = round(max(b - a for a, b in zip(janela_ts, janela_ts[1:])), 2)
         res["clientes"][no] = c
     return res
 
@@ -113,8 +113,16 @@ def main():
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--loss-gestao", type=float, default=0.0)
     p.add_argument("--json", action="store_true")
+    p.add_argument("--data-interval", type=float, default=1.0,
+                   help="intervalo entre pacotes DATA (s); 0.05 = video a 20 fps")
+    p.add_argument("--extra", action="append", default=[], choices=["keepalive"],
+                   help="liga um extra: keepalive = dados como keepalive")
     a = p.parse_args()
-    res = medir(a.topology, a.serve, a.watch, a.kill, a.kill_at, a.ate, a.janela, a.seed, a.loss_gestao)
+    opts = {"data_interval": a.data_interval}
+    if "keepalive" in a.extra:
+        opts["keepalive_dados"] = True
+    res = medir(a.topology, a.serve, a.watch, a.kill, a.kill_at, a.ate, a.janela, a.seed,
+                a.loss_gestao, opts)
     if a.json:
         print(json.dumps(res, indent=2, ensure_ascii=False))
     else:
