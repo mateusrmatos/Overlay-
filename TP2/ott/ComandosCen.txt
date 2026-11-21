@@ -1,0 +1,84 @@
+https://github.com/mateusrmatos/Overlay-.git
+
+Bootstrapper: cd /home/core/Overlay-/TP2/ott
+	      T=cenarios/cenario1.json
+	      python3 ott.py bootstrap --topology $T --trace
+
+
+		cd /home/core/Overlay-/TP2/ott
+
+	-> python3 ott.py bootstrap --topology cenarios/cenario1.json --trace
+python3 /home/core/Overlay-/TP2/ott/ott.py node --name N1 --boot 172.16.0.254:9000 --trace
+
+Flood : Nos : 
+S1
+python3 /home/core/Overlay-/TP2/ott/ott.py node --name S1 --boot 172.16.0.254:9000 --serve video1 --trace
+
+Nos normais (intermedios): 
+python3 /home/core/Overlay-/TP2/ott/ott.py node --name N1 --boot 172.16.0.254:9000 --trace
+
+Nos clientes:
+python3 /home/core/Overlay-/TP2/ott/ott.py node --name C1 --boot 172.16.0.254:9000 --watch video1 --trace
+python3 /home/core/Overlay-/TP2/ott/ott.py node --name C2 --boot 172.16.0.254:9000 --watch video1 --trace
+
+Cenario 2:
+Bootstrapper: 
+	cd /home/core/Overlay-/TP2/ott
+	T=cenarios/cenario2.json
+	python3 ott.py bootstrap --topology $T --trace
+
+S1 : python3 /home/core/Overlay-/TP2/ott/ott.py node --name S1 --boot 172.16.0.254:9000 --serve video1 --trace
+
+Nos normais (intermedios):
+python3 /home/core/Overlay-/TP2/ott/ott.py node --name N1 --boot 172.16.0.254:9000 --trace
+python3 /home/core/Overlay-/TP2/ott/ott.py node --name N2 --boot 172.16.0.254:9000 --trace
+python3 /home/core/Overlay-/TP2/ott/ott.py node --name N3 --boot 172.16.0.254:9000 --trace
+
+Nos clientes: 
+python3 /home/core/Overlay-/TP2/ott/ott.py node --name C1 --boot 172.16.0.254:9000 --watch video1 --trace
+python3 /home/core/Overlay-/TP2/ott/ott.py node --name C2 --boot 172.16.0.254:9000 --watch video1 --trace
+
+Cenario2 modo 2 transmisao de video real:
+S1 :
+python3 /home/core/Overlay-/TP2/ott/ott.py node --name S1 --boot 172.16.0.254:9000 --serve video1 --ingest-port 8888
+
+C1:
+python3 /home/core/Overlay-/TP2/ott/ott.py node --name C1 --boot 172.16.0.254:9000 --watch video1 --player-port 9999
+Aba 2 C1:
+ffplay -fflags nobuffer -flags low_delay -i udp://127.0.0.1:9999
+
+Aba 2 S1:
+ffmpeg -re -f lavfi -i testsrc=size=640x360:rate=25-c:v mpeg2video -b:v 800k -f mpgets udp://127.0.0.1:8888?pkt_size=1316
+ 
+
+Cenario 3:
+Bootstrapper: 
+	cd /home/core/Overlay-/TP2/ott
+	T=cenarios/cenario2.json
+	python3 ott.py bootstrap --topology $T --trace
+
+Nos intermedios:
+python3 /home/core/Overlay-/TP2/ott/ott.py node --name O1 --boot 10.0.16.21:9000 --watch video1 --trace
+
+Servidores:
+
+python3 /home/core/Overlay-/TP2/ott/ott.py node --name S1 --boot 10.0.16.21:9000 --serve video1 --ingest-port 8888
+
+CLiente:
+python3 /home/core/Overlay-/TP2/ott/ott.py node --name C1 --boot 10.0.16.21:9000 --watch video1 --player-port 9999
+
+Aba 2 dos clientes:
+ffplay -fflags nobuffer -flags low_delay -i udp://127.0.0.1:9999
+
+Iniciar a emissao de video:
+ffmpeg -re -f lavfi -i testsrc=size=640x360:rate=25-c:v mpeg2video -b:v 800k -f mpgets udp://127.0.0.1:8888?pkt_size=1316
+
+ffmpeg -re -f lavfi -i testsrc2=size=640x360:rate=25 -c:v mpeg2video -b:v 800k -f mpegts udp://127.0.0.1:8888?pkt_size=1316
+Mandar ligacao a baixo: 
+
+ip link set eth2 down  (verificar interface antes)
+
+
+
+
+
