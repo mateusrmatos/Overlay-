@@ -1,4 +1,4 @@
-"""Nucleo do protocolo (sans-I/O) - Marco 1, 2, Dados & Metrica Dinamica SRTT.
+"""Nucleo do protocolo (sans-I/O) - Marco 1, 2, Dados & Blindagem Fase 1.
 
 Ideia central: este modulo NAO abre sockets, NAO dorme, NAO le o relogio.
 Recebe EVENTOS (arrancar, chegou um pacote, expirou um temporizador) e devolve ACOES
@@ -20,9 +20,13 @@ Log = namedtuple("Log", "text")
 # ------------------------------------------------------------------ parametros
 REGISTER_RTO0, REGISTER_RTO_MAX, REGISTER_TRIES = 0.5, 4.0, 10
 HELLO_RTO0, HELLO_RTO_MAX, HELLO_TRIES = 0.2, 4.0, 5
+CTRL_RTO0, CTRL_RTO_MAX, CTRL_TRIES = 0.3, 1.5, 4     # retransmissao de ACTIVATE/DEACTIVATE
 
 HELLO_INTERVAL, HELLO_DEAD_AFTER = 1.0, 3.0
 RTT_ALPHA = 0.125
+LOSS_ALPHA = 0.125             # media movel exponencial para perda de sondas HELLO
+LOSS_DEADZONE = 0.02           # abaixo de 2% ignora ruido residual de perda
+LOSS_PENALTY_MS = 200.0        # penalizacao aditiva (ms) para links locais com perda
 
 # Flood periodico de rotas (Servidor -> Rede) e tempo de expiracao (3 periodos)
 ADVERT_INTERVAL = 2.0
@@ -31,7 +35,7 @@ ROUTE_STALE_AFTER = 6.0
 # Intervalo de emissao de pacotes DATA de teste quando uma stream local esta ATIVA
 DATA_INTERVAL = 1.0
 
-# Metrica dinamica baseada no atraso medido (SRTT em ms) e margem de histerese (15%)
+# Metrica dinamica baseada no atraso medido (SRTT em ms) + perda e margem de histerese (15%)
 DEFAULT_LINK_COST_MS = 100.0   # custo temporario antes da primeira sonda medir o SRTT
 MIN_LINK_COST_MS = 0.5         # piso minimo (evita custo 0 em ligacoes locais sem atraso)
 ROUTE_HYSTERESIS = 0.15        # so troca de origem se a alternativa for >= 15% mais rapida
@@ -57,13 +61,14 @@ class Pending:
 
 class Vizinho:
     """O que um no sabe de um vizinho: so isto. Nunca o grafo completo."""
-    __slots__ = ("name", "addr", "alive", "last_heard", "rtt", "srtt",
+    __slots__ = ("name", "addr", "alive", "last_heard", "rtt", "srtt", "min_rtt", "loss",
                  "last_data", "gap", "last_probe")
 
     def __init__(self, name, addr):
         self.name, self.addr = name, addr
         self.alive, self.last_heard = False, None
-        self.rtt = self.srtt = None
+        self.rtt = self.srtt = self.min_rtt = None
+        self.loss = 0.0           # taxa de perda estimada nas sondas HELLO (0.0 a 1.0)
         self.last_data = None     # instante do ultimo DATA recebido deste vizinho
         self.gap = None           # media movel do intervalo entre DATA consecutivos
         self.last_probe = None    # instante do ultimo HELLO periodico enviado
@@ -77,7 +82,7 @@ class Rota:
     Mantem a rota principal (origem, custo), caminhos alternativos e contadores de dados."""
     __slots__ = (
         "stream", "server", "origem", "custo", "seq", "last_updated",
-        "destinos", "alternativas", "local", "consumo_local",
+        "destinos", "alternativas", "seq_por_srv", "local", "consumo_local",
         "frames_enviadas", "frames_recebidas", "ultima_frame", "visto",
     )
 
@@ -89,7 +94,10 @@ class Rota:
         self.seq = seq
         self.last_updated = now
         self.destinos = set()
-        self.alternativas = {}
+        self.alternativas = {}    # vizinho -> (custo, seq, server)
+        self.seq_por_srv = {}     # server -> (ultimo_seq, last_updated)
+        if not local and server is not None and seq is not None:
+            self.seq_por_srv[server] = (seq, now)
         self.local = local
         self.consumo_local = False
         self.frames_enviadas = 0
@@ -140,7 +148,7 @@ class Node:
         self.active_hello_interval = active_hello_interval   # HELLO esparso nas arestas com dados
         self.refresh_interval = refresh_interval             # periodo do ACTIVATE (soft state)
         self.silence_factor, self.silence_min = silence_factor, silence_min
-        self.silence_confirm = silence_confirm               # prazo para o HELLO de confirmacao
+        self.silence_confirm = silence_confirm               # piso minimo para confirmacao HELLO
         if tick_interval is None:
             tick_interval = min(hello_interval, silence_min / 2) if keepalive_dados else hello_interval
         self._tick_period = tick_interval
@@ -246,10 +254,13 @@ class Node:
             if p.kind == "REGISTER":
                 self.state = ORPHAN
                 acts.append(Log(f"REGISTER sem resposta apos {p.tries} tentativas: desisto"))
-            else:
+            elif p.kind == "HELLO":
                 acts.append(Log(f"{p.kind} para {p.peer} sem ACK apos {p.tries} tentativas "
                                 f"(o vizinho pode ainda nao ter arrancado; continuo a sondar "
                                 f"a cada {self.hello_interval:g}s)"))
+            else:
+                viz, st = p.peer
+                acts.append(Log(f"{p.kind} [{st}] para {viz} sem ACK apos {p.tries} tentativas"))
             return
         p.tries += 1
         p.rto = min(p.rto * 2, p.rto_max)
@@ -319,6 +330,10 @@ class Node:
             v.last_heard = now
             if era_morto:
                 self._enviar_rotas_conhecidas_a(acts, v)
+        elif p.kind in ("ACTIVATE", "DEACTIVATE"):
+            v = self._vizinho_por_addr(src)
+            if v is not None:
+                v.last_heard = now
 
     # ------------------------------------------------------------ handlers Marco 2 (Flood e Rotas)
     def _on_advert(self, acts, now, src, mid, payload):
@@ -339,26 +354,28 @@ class Node:
             self._propagar_advert(acts, self.rotas[stream], exceto=v.name)
 
     def _on_activate(self, acts, now, src, mid, payload):
-        """Recebe pedido de ativacao de um vizinho a jusante."""
+        """Recebe pedido de ativacao de um vizinho a jusante e confirma com ACK (idempotente)."""
         stream = wire.dec_stream_msg(payload)
         v = self._vizinho_por_addr(src)
         if v is None:
             return
+        acts.append(Send(tuple(src), wire.enc_ack(mid)))
         v.last_heard = now
         r = self.rotas.get(stream)
         if r is not None and v.name in r.destinos:
-            r.visto[v.name] = now          # refresh: so renova o prazo do destino
+            r.visto[v.name] = now          # refresh ou retransmissao: renova o prazo do destino
             return
         self.adicionar_destino_rota(acts, stream, v.name)
         if r is not None:
             r.visto[v.name] = now
 
     def _on_deactivate(self, acts, now, src, mid, payload):
-        """Recebe cancelamento de stream de um vizinho a jusante."""
+        """Recebe cancelamento de stream de um vizinho a jusante e confirma com ACK (idempotente)."""
         stream = wire.dec_stream_msg(payload)
         v = self._vizinho_por_addr(src)
         if v is None:
             return
+        acts.append(Send(tuple(src), wire.enc_ack(mid)))
         v.last_heard = now
         self.remover_destino_rota(acts, stream, v.name)
 
@@ -376,12 +393,12 @@ class Node:
             self._propagar_advert(acts, r, exceto=None)
 
     def _propagar_advert(self, acts, r, exceto=None):
-        """Inundacao controlada: envia ADVERT com o custo deste no a todos os vizinhos vivos,
-        exceto ao que nos enviou o anuncio (`exceto`) e ao proprio servidor da stream."""
+        """Inundacao controlada (Split Horizon): envia ADVERT com o custo deste no a todos os
+        vizinhos vivos, exceto a quem enviou (`exceto`), a propria origem atual e ao servidor."""
         if not r.tem_montante or r.seq is None or r.custo == float("inf"):
             return
         for v in self.vizinhos.values():
-            if not v.alive or v.name == exceto or v.name == r.server:
+            if not v.alive or v.name == exceto or v.name == r.origem or v.name == r.server:
                 continue
             mid = self._new_id()
             self._send(acts, v.addr, wire.enc_advert(mid, r.stream, r.server, r.seq, r.custo))
@@ -440,10 +457,9 @@ class Node:
         self._nota_dados(v, now)
         r = self.rotas.get(stream)
 
-        # Se nao temos rota ativa ou o pacote veio de quem nao e a nossa origem atual:
-        # descartamos e enviamos DEACTIVATE para cortar o ramo desnecessario a montante.
+        # RPF: se nao temos rota ativa ou veio de quem nao e a origem atual, descarta e poda o ramo
         if r is None or r.local or not r.ativa or v.name != r.origem:
-            self._enviar_controlo_rota(acts, wire.T_DEACTIVATE, v.name, stream)
+            self._enviar_controlo_rota(acts, wire.T_DEACTIVATE, v.name, stream, fiavel=False)
             return
 
         r.frames_recebidas += 1
@@ -467,9 +483,25 @@ class Node:
                                 f"({len(body)}B, total={r.frames_recebidas})"))
 
     # ------------------------------------------------------------ monitorizacao dos vizinhos
+    def _probe_timeout(self, v):
+        """Prazo a partir do qual uma sonda HELLO e considerada perdida (adaptativo ao SRTT)."""
+        if v is None or v.srtt is None:
+            return min(self.dead_after, 2.0)
+        return min(self.dead_after, max(2.0, 2.5 * v.srtt))
+
     def _on_tick(self, acts, now):
         acts.append(SetTimer(("tick",), self._tick_period))
-        self.probes = {m: pr for m, pr in self.probes.items() if now - pr[1] < self.dead_after}
+        # Sondas HELLO sem resposta dentro do prazo contam como amostra de perda na ligacao
+        novas_probes = {}
+        for m, (nome, t_envio) in self.probes.items():
+            v = self.vizinhos.get(nome)
+            if now - t_envio >= self._probe_timeout(v):
+                if v is not None and v.alive:
+                    v.loss = (1.0 - LOSS_ALPHA) * v.loss + LOSS_ALPHA * 1.0
+            else:
+                novas_probes[m] = (nome, t_envio)
+        self.probes = novas_probes
+
         for v in self.vizinhos.values():
             if v.alive and v.last_heard is not None and now - v.last_heard > self._limite_silencio(v):
                 self._vizinho_caiu(acts, now, v)
@@ -506,44 +538,45 @@ class Node:
                 jusante = True
         return montante, jusante
 
+    def _confirm_para(self, v):
+        """Prazo de confirmacao do HELLO sob suspeita de silencio, escalado pelo SRTT."""
+        if v.srtt is None:
+            return self.silence_confirm
+        return min(self.dead_after * 0.6, max(self.silence_confirm, 3.0 * v.srtt))
+
     def _suspeita_dados(self, v):
-        """Silencio de dados a partir do qual SUSPEITAMOS do vizinho a montante (None se nao se
-        aplica). Suspeitar nao e declarar a morte: silencio de dados tambem acontece quando o
-        vizinho esta vivo mas ficou sem dados dele (falha mais acima). Por isso confirma-se com HELLO."""
+        """Silencio de dados a partir do qual SUSPEITAMOS do vizinho a montante."""
         if not self.keepalive_dados:
             return None
         montante, _ = self._papeis(v)
         if montante and v.gap is not None:
-            return min(self.dead_after - self.silence_confirm,
+            confirm = self._confirm_para(v)
+            return min(self.dead_after - confirm,
                        max(self.silence_min, self.silence_factor * v.gap))
         return None
 
     def _limite_silencio(self, v):
-        """Silencio a partir do qual o vizinho e dado como caido.
-        Baseline: sempre dead_after. Com o extra: se o vizinho nos envia video, bastam alguns
-        intervalos entre pacotes sem dados (limitado por dead_after); se so recebe de nos, o
-        prazo e o do soft state (3 refrescos)."""
+        """Silencio a partir do qual o vizinho e dado como caido."""
         if not self.keepalive_dados:
             return self.dead_after
         montante, jusante = self._papeis(v)
         limites = []
         if montante:
             susp = self._suspeita_dados(v)
-            # suspeita + prazo de confirmacao: so se da como morto se o HELLO tambem nao for respondido
-            limites.append(susp + self.silence_confirm if susp is not None else self.dead_after)
+            confirm = self._confirm_para(v)
+            limites.append(susp + confirm if susp is not None else self.dead_after)
         if jusante and not montante:
             limites.append(max(self.dead_after, 3 * self.refresh_interval))
         return min(limites) if limites else self.dead_after
 
     def _deve_sondar(self, v, now):
-        """HELLO periodico: todos os hello_interval nas arestas sem dados; so a cada
-        active_hello_interval (para o RTT) nas arestas onde o video ja prova que esta viva."""
+        """HELLO periodico: todos os hello_interval nas arestas sem dados; esparso nas ativas."""
         if v.last_probe is None:
             return True
         susp = self._suspeita_dados(v)
         if susp is not None and v.last_heard is not None and now - v.last_heard > susp:
-            # os dados calaram-se: confirma ja, com um HELLO (e repete ate haver resposta)
-            return now - v.last_probe >= self.silence_confirm / 2 - 1e-9
+            confirm = self._confirm_para(v)
+            return now - v.last_probe >= confirm / 2 - 1e-9
         montante, jusante = self._papeis(v)
         com_dados = (montante and v.last_data is not None
                      and now - v.last_data <= self._limite_silencio(v))
@@ -558,7 +591,7 @@ class Node:
         self._ultimo_refresh = now
         for r in self.rotas.values():
             if r.ativa and not r.local and r.origem is not None:
-                self._enviar_controlo_rota(acts, wire.T_ACTIVATE, r.origem, r.stream)
+                self._enviar_controlo_rota(acts, wire.T_ACTIVATE, r.origem, r.stream, fiavel=False)
 
     def _expirar_destinos(self, acts, now):
         """Soft state: um destino que deixou de renovar o ACTIVATE durante 3 periodos e apagado."""
@@ -575,7 +608,9 @@ class Node:
         if v is None or v.addr[0] != src[0]:
             return
         v.rtt = now - t_envio
-        v.srtt = v.rtt if v.srtt is None else (1 - RTT_ALPHA) * v.srtt + RTT_ALPHA * v.rtt
+        v.srtt = v.rtt if v.srtt is None else (1.0 - RTT_ALPHA) * v.srtt + RTT_ALPHA * v.rtt
+        v.min_rtt = v.rtt if v.min_rtt is None else min(v.min_rtt, v.rtt)
+        v.loss = (1.0 - LOSS_ALPHA) * v.loss
         era_morto = not v.alive
         if era_morto:
             voltou = v.last_heard is not None
@@ -588,8 +623,14 @@ class Node:
     def _vizinho_caiu(self, acts, now, v):
         acts.append(Log(f"vizinho {v.name} CAIU (sem sinal ha {now - v.last_heard:.1f}s)"))
         v.alive = False
-        v.rtt = v.srtt = None
-        self._remover_vizinho_das_rotas(acts, v.name)
+        v.rtt = v.srtt = v.min_rtt = None
+        v.loss = 0.0
+        v.last_data = v.gap = None
+        # Cancela comandos de controlo pendentes para este vizinho morto
+        for old_mid in [m for m, p in self.pending.items()
+                        if p.kind in ("ACTIVATE", "DEACTIVATE") and p.peer[0] == v.name]:
+            self._settle(acts, old_mid)
+        self._remover_vizinho_das_rotas(acts, v.name, now)
 
     # ------------------------------------------------------------ tabela de rotas
     def custo_ligacao(self, nome_vizinho):
@@ -599,7 +640,12 @@ class Node:
         if v is None or v.srtt is None:
             return DEFAULT_LINK_COST_MS
         # v.srtt esta em segundos (ida e volta); dividimos por 2 para atraso unidirecional em ms
-        return max(MIN_LINK_COST_MS, v.srtt * 500.0)
+        base_ms = max(MIN_LINK_COST_MS, v.srtt * 500.0)
+        if v.loss < LOSS_DEADZONE:
+            return base_ms
+        # Metrica composta: atraso escalado por ETX + penalizacao aditiva de perda
+        fator = 1.0 / max(0.05, 1.0 - v.loss)
+        return base_ms * fator + LOSS_PENALTY_MS * v.loss
 
     def _melhor_com_histerese(self, novo_custo, custo_atual):
         """Evita oscilacoes por ruido: exige que a nova rota seja melhor pelo menos na margem de histerese."""
@@ -607,14 +653,33 @@ class Node:
             return True
         return novo_custo < custo_atual * (1.0 - self.hysteresis)
 
-    def _enviar_controlo_rota(self, acts, tipo, nome_vizinho, stream):
+    def _srv_fresco(self, r, srv, now):
+        info = r.seq_por_srv.get(srv)
+        if info is None:
+            return False
+        if self.route_stale_after is None:
+            return True
+        return (now - info[1]) <= self.route_stale_after
+
+    def _enviar_controlo_rota(self, acts, tipo, nome_vizinho, stream, fiavel=True):
         if nome_vizinho is None:
             return
         v = self.vizinhos.get(nome_vizinho)
         if v is None:
             return
+        # Cancela ACTIVATE/DEACTIVATE anterior pendente para o mesmo (vizinho, stream)
+        alvo = (nome_vizinho, stream)
+        for old_mid in [m for m, p in self.pending.items()
+                        if p.kind in ("ACTIVATE", "DEACTIVATE") and p.peer == alvo]:
+            self._settle(acts, old_mid)
         mid = self._new_id()
-        self._send(acts, v.addr, wire.enc_stream_msg(tipo, mid, stream))
+        pkt = wire.enc_stream_msg(tipo, mid, stream)
+        if fiavel:
+            kind = "ACTIVATE" if tipo == wire.T_ACTIVATE else "DEACTIVATE"
+            self._send_reliable(acts, v.addr, mid, pkt,
+                                CTRL_RTO0, CTRL_RTO_MAX, CTRL_TRIES, kind, peer=alvo)
+        else:
+            self._send(acts, v.addr, pkt)
 
     def registar_stream_local(self, stream):
         r = self.rotas.get(stream)
@@ -651,6 +716,29 @@ class Node:
             self._enviar_controlo_rota(acts, wire.T_DEACTIVATE, r.origem, stream)
         return estava_ativa and not r.ativa
 
+    def _promover_melhor_alternativa(self, acts, r, now, motivo):
+        """Verifica se alguma alternativa viva e fresca bate a origem atual (com histerese)."""
+        candidatas = {}
+        for v, (c, s, srv) in r.alternativas.items():
+            if v not in self.vizinhos or not self.vizinhos[v].alive or c == float("inf"):
+                continue
+            fresca = (srv == r.server and s == r.seq) or (srv != r.server and self._srv_fresco(r, srv, now))
+            if fresca and self._melhor_com_histerese(c, r.custo):
+                candidatas[v] = (c, s, srv)
+        if not candidatas:
+            return False
+        origem_antiga = r.origem
+        melhor_v = min(candidatas, key=lambda v: candidatas[v][0])
+        if origem_antiga is not None and r.custo != float("inf"):
+            r.alternativas[origem_antiga] = (r.custo, r.seq, r.server)
+        c, s, srv = r.alternativas.pop(melhor_v)
+        r.origem, r.custo, r.seq, r.server = melhor_v, c, s, srv
+        if srv in r.seq_por_srv:
+            r.last_updated = r.seq_por_srv[srv][1]
+        acts.append(Log(f"{motivo} na rota {r.stream}: {origem_antiga} -> {r.origem} "
+                        f"(srv={r.server}, {r.custo:.1f}ms)"))
+        return True
+
     def atualizar_rota(self, acts, stream, server, vizinho_origem, custo_anunciado, seq, now=0.0):
         if vizinho_origem not in self.vizinhos or server == self.name or custo_anunciado == float("inf"):
             return False
@@ -667,28 +755,77 @@ class Node:
         if r.local:
             return False
 
+        # Caso 2: Anuncio de OUTRO servidor (ex.: S2 enquanto usamos S1) -> valida seq proprio desse servidor
+        if r.server != server:
+            srv_info = r.seq_por_srv.get(server)
+            if srv_info is not None:
+                last_seq = srv_info[0]
+                if seq != last_seq and not _seq_mais_recente(seq, last_seq):
+                    return False
+                if _seq_mais_recente(seq, last_seq) or seq == last_seq:
+                    r.seq_por_srv[server] = (seq, now)
+            else:
+                r.seq_por_srv[server] = (seq, now)
+
+            eh_mesma_origem = (vizinho_origem == r.origem)
+            melhor_alternativa = (r.origem is None) or self._melhor_com_histerese(novo_custo, r.custo)
+
+            if eh_mesma_origem or melhor_alternativa:
+                origem_antiga = r.origem
+                tinha_jusante = r.tem_jusante
+                if not eh_mesma_origem and origem_antiga is not None and r.custo != float("inf"):
+                    r.alternativas[origem_antiga] = (r.custo, r.seq, r.server)
+                r.alternativas.pop(vizinho_origem, None)
+                r.server = server
+                r.seq = seq
+                r.last_updated = now
+                r.origem = vizinho_origem
+                r.custo = novo_custo
+                if eh_mesma_origem:
+                    self._promover_melhor_alternativa(acts, r, now, f"troca apos mudanca de srv (seq={seq})")
+                acts.append(Log(f"troca de servidor (seq={seq}): {r}"))
+                if tinha_jusante and r.origem != origem_antiga:
+                    self._enviar_controlo_rota(acts, wire.T_ACTIVATE, r.origem, stream)
+                    if origem_antiga is not None:
+                        self._enviar_controlo_rota(acts, wire.T_DEACTIVATE, origem_antiga, stream)
+                return True
+
+            antigo = r.alternativas.get(vizinho_origem)
+            if (antigo is None or (antigo[2] == server and (antigo[1] != seq or novo_custo < antigo[0]))
+                    or novo_custo < antigo[0]):
+                r.alternativas[vizinho_origem] = (novo_custo, seq, server)
+            return False
+
+        # Caso 3: Anuncio do MESMO servidor ativo (r.server == server)
         seq_novo = r.seq is None or _seq_mais_recente(seq, r.seq)
         seq_igual = r.seq is not None and seq == r.seq
 
         if not seq_novo and not seq_igual:
             return False
 
-        # Caso 2: Nova ronda de anuncio do servidor (seq mais recente)
+        # Atualiza registo de frescura deste servidor
+        srv_info = r.seq_por_srv.get(server)
+        if srv_info is None or seq == srv_info[0] or _seq_mais_recente(seq, srv_info[0]):
+            r.seq_por_srv[server] = (seq, now)
+
+        # Caso 3a: Nova ronda de anuncio do servidor (seq mais recente)
         if seq_novo:
             eh_mesma_origem = (vizinho_origem == r.origem)
             melhor_alternativa = (r.origem is None) or self._melhor_com_histerese(novo_custo, r.custo)
             if not (eh_mesma_origem or melhor_alternativa):
-                r.alternativas[vizinho_origem] = (novo_custo, seq)
+                r.alternativas[vizinho_origem] = (novo_custo, seq, server)
                 return False
 
             origem_antiga = r.origem
             tinha_jusante = r.tem_jusante
+            # Limpa alternativas obsoletas deste servidor, preservando alternativas frescas de outros servidores
             r.alternativas = {
-                v: (c, s) for v, (c, s) in r.alternativas.items()
-                if s is not None and (s == seq or _seq_mais_recente(s, seq))
+                v: (c, s, srv) for v, (c, s, srv) in r.alternativas.items()
+                if (srv == server and s is not None and (s == seq or _seq_mais_recente(s, seq)))
+                or (srv != server and self._srv_fresco(r, srv, now))
             }
             if not eh_mesma_origem and origem_antiga is not None and r.custo != float("inf"):
-                r.alternativas[origem_antiga] = (r.custo, r.seq)
+                r.alternativas[origem_antiga] = (r.custo, r.seq, r.server)
             r.alternativas.pop(vizinho_origem, None)
             r.server = server
             r.seq = seq
@@ -696,19 +833,8 @@ class Node:
             r.origem = vizinho_origem
             r.custo = novo_custo
 
-            # Se a origem atual degradou nesta ronda, verifica se ja existe alternativa melhor com o mesmo seq
             if eh_mesma_origem:
-                alt_mesma_ronda = {
-                    v: (c, s) for v, (c, s) in r.alternativas.items()
-                    if s == seq and v in self.vizinhos and self.vizinhos[v].alive
-                    and self._melhor_com_histerese(c, r.custo)
-                }
-                if alt_mesma_ronda:
-                    melhor_v = min(alt_mesma_ronda, key=lambda v: alt_mesma_ronda[v][0])
-                    r.alternativas[r.origem] = (r.custo, seq)
-                    r.origem, (r.custo, _) = melhor_v, r.alternativas.pop(melhor_v)
-                    acts.append(Log(f"troca por atraso (seq={seq}) na rota {stream}: "
-                                    f"{origem_antiga} -> {r.origem} ({r.custo:.1f}ms)"))
+                self._promover_melhor_alternativa(acts, r, now, f"soft failover por degradacao (seq={seq})")
 
             acts.append(Log(f"rota atualizada (seq={seq}): {r}"))
             if tinha_jusante and r.origem != origem_antiga:
@@ -717,7 +843,7 @@ class Node:
                     self._enviar_controlo_rota(acts, wire.T_DEACTIVATE, origem_antiga, stream)
             return True
 
-        # Caso 3: Mesmo seq (anuncio que chegou por outro caminho na mesma inundacao)
+        # Caso 3b: Mesmo seq (anuncio que chegou por outro caminho na mesma inundacao)
         if vizinho_origem == r.origem:
             r.last_updated = now
             if novo_custo < r.custo:
@@ -729,7 +855,7 @@ class Node:
             origem_antiga = r.origem
             tinha_jusante = r.tem_jusante
             if origem_antiga is not None and r.custo != float("inf"):
-                r.alternativas[origem_antiga] = (r.custo, r.seq)
+                r.alternativas[origem_antiga] = (r.custo, r.seq, r.server)
             r.origem = vizinho_origem
             r.custo = novo_custo
             r.last_updated = now
@@ -741,10 +867,10 @@ class Node:
                     self._enviar_controlo_rota(acts, wire.T_DEACTIVATE, origem_antiga, stream)
             return True
 
-        # Caso 4: Caminho mais longo ou dentro da margem de histerese -> guarda-se como alternativa
+        # Caminho mais longo ou dentro da margem de histerese -> guarda-se como alternativa
         antigo = r.alternativas.get(vizinho_origem)
-        if antigo is None or antigo[1] != seq or novo_custo < antigo[0]:
-            r.alternativas[vizinho_origem] = (novo_custo, seq)
+        if antigo is None or (antigo[2] == server and (antigo[1] != seq or novo_custo < antigo[0])) or novo_custo < antigo[0]:
+            r.alternativas[vizinho_origem] = (novo_custo, seq, server)
         return False
 
     def adicionar_destino_rota(self, acts, stream, vizinho_destino):
@@ -776,7 +902,7 @@ class Node:
                 self._enviar_controlo_rota(acts, wire.T_DEACTIVATE, r.origem, stream)
         return desativou_agora
 
-    def _remover_vizinho_das_rotas(self, acts, nome_viz):
+    def _remover_vizinho_das_rotas(self, acts, nome_viz, now=0.0):
         for r in self.rotas.values():
             r.alternativas.pop(nome_viz, None)
             if nome_viz in r.destinos:
@@ -785,15 +911,25 @@ class Node:
             if r.origem == nome_viz:
                 tinha_jusante = r.tem_jusante
                 dist_viavel = r.custo      # custo que tinha pela origem que morreu
-                # condicao de viabilidade (DUAL): a alternativa tem de anunciar um custo estritamente
-                # menor do que a minha distancia viavel, senao o caminho dela pode passar por mim (ciclo)
-                validas = {v: (c, s) for v, (c, s) in r.alternativas.items()
-                           if v in self.vizinhos and self.vizinhos[v].alive and c != float("inf")
-                           and (c - self.custo_ligacao(v)) < dist_viavel}
+                validas = {}
+                for v, (c, s, srv) in r.alternativas.items():
+                    if v not in self.vizinhos or not self.vizinhos[v].alive or c == float("inf"):
+                        continue
+                    if srv == r.server:
+                        # Condicao de viabilidade (DUAL): evita ciclos dentro da mesma arvore
+                        if (c - self.custo_ligacao(v)) < dist_viavel:
+                            validas[v] = (c, s, srv)
+                    elif self._srv_fresco(r, srv, now):
+                        # Arvore independente de outro servidor (permite failover imediato S1 -> S2)
+                        validas[v] = (c, s, srv)
                 if validas:
                     melhor_v = min(validas, key=lambda v: validas[v][0])
-                    r.origem, (r.custo, r.seq) = melhor_v, r.alternativas.pop(melhor_v)
-                    acts.append(Log(f"failover da rota {r.stream}: nova origem {r.origem} (custo {r.custo:.1f})"))
+                    c, s, srv = r.alternativas.pop(melhor_v)
+                    r.origem, r.custo, r.seq, r.server = melhor_v, c, s, srv
+                    if srv in r.seq_por_srv:
+                        r.last_updated = r.seq_por_srv[srv][1]
+                    acts.append(Log(f"failover da rota {r.stream}: nova origem {r.origem} "
+                                    f"(srv={r.server}, custo {r.custo:.1f})"))
                     if tinha_jusante:
                         self._enviar_controlo_rota(acts, wire.T_ACTIVATE, r.origem, r.stream)
                 else:
@@ -804,12 +940,44 @@ class Node:
         if self.route_stale_after is None:
             return
         for r in self.rotas.values():
-            if r.local or r.seq is None:
+            if r.local:
                 continue
-            if now - r.last_updated > self.route_stale_after:
+            # Expira registos de servidores que deixaram de anunciar
+            expirados = [srv for srv, (_, ts) in r.seq_por_srv.items()
+                         if now - ts > self.route_stale_after]
+            if expirados:
+                exp_set = set(expirados)
+                for srv in expirados:
+                    del r.seq_por_srv[srv]
+                r.alternativas = {v: tup for v, tup in r.alternativas.items() if tup[2] not in exp_set}
+
+            if r.seq is None or now - r.last_updated <= self.route_stale_after:
+                continue
+
+            # Servidor principal expirou: se ja existir alternativa fresca de outro servidor, promove na hora
+            validas = {
+                v: tup for v, tup in r.alternativas.items()
+                if v in self.vizinhos and self.vizinhos[v].alive
+                and tup[0] != float("inf") and self._srv_fresco(r, tup[2], now)
+            }
+            if validas:
+                origem_antiga = r.origem
+                tinha_jusante = r.tem_jusante
+                melhor_v = min(validas, key=lambda v: validas[v][0])
+                c, s, srv = r.alternativas.pop(melhor_v)
+                r.origem, r.custo, r.seq, r.server = melhor_v, c, s, srv
+                r.last_updated = r.seq_por_srv[srv][1]
+                acts.append(Log(f"rota {r.stream} expirou; failover imediato para srv={srv} "
+                                f"via {melhor_v} ({c:.1f}ms)"))
+                if tinha_jusante and melhor_v != origem_antiga:
+                    self._enviar_controlo_rota(acts, wire.T_ACTIVATE, melhor_v, r.stream)
+                    if origem_antiga is not None:
+                        self._enviar_controlo_rota(acts, wire.T_DEACTIVATE, origem_antiga, r.stream)
+                self._propagar_advert(acts, r, exceto=melhor_v)
+            else:
                 r.seq = None
                 r.alternativas.clear()
-                r.origem, r.custo = None, float("inf")    # custo velho nao pode bloquear (histerese) o anuncio novo
+                r.origem, r.custo = None, float("inf")
                 acts.append(Log(f"rota {r.stream} expirou por falta de anuncios (pronta para re-sincronizar seq)"))
 
 
