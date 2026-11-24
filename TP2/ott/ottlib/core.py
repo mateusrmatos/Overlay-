@@ -57,12 +57,16 @@ class Pending:
 
 class Vizinho:
     """O que um no sabe de um vizinho: so isto. Nunca o grafo completo."""
-    __slots__ = ("name", "addr", "alive", "last_heard", "rtt", "srtt")
+    __slots__ = ("name", "addr", "alive", "last_heard", "rtt", "srtt",
+                 "last_data", "gap", "last_probe")
 
     def __init__(self, name, addr):
         self.name, self.addr = name, addr
         self.alive, self.last_heard = False, None
         self.rtt = self.srtt = None
+        self.last_data = None     # instante do ultimo DATA recebido deste vizinho
+        self.gap = None           # media movel do intervalo entre DATA consecutivos
+        self.last_probe = None    # instante do ultimo HELLO periodico enviado
 
     def __repr__(self):
         return f"Vizinho({self.name}, {self.addr}, {'vivo' if self.alive else 'sem contacto'})"
@@ -74,7 +78,7 @@ class Rota:
     __slots__ = (
         "stream", "server", "origem", "custo", "seq", "last_updated",
         "destinos", "alternativas", "local", "consumo_local",
-        "frames_enviadas", "frames_recebidas", "ultima_frame",
+        "frames_enviadas", "frames_recebidas", "ultima_frame", "visto",
     )
 
     def __init__(self, stream, server, origem, custo, seq, now=0.0, local=False):
@@ -91,6 +95,7 @@ class Rota:
         self.frames_enviadas = 0
         self.frames_recebidas = 0
         self.ultima_frame = None
+        self.visto = {}           # destino -> instante do ultimo ACTIVATE (soft state)
 
     @property
     def tem_montante(self):
@@ -121,13 +126,25 @@ class Node:
     def __init__(self, name, boot_addr, hello_interval=HELLO_INTERVAL, dead_after=HELLO_DEAD_AFTER,
                  advert_interval=ADVERT_INTERVAL, route_stale_after=ROUTE_STALE_AFTER,
                  data_interval=DATA_INTERVAL, streams=(), watch=(), player_addr=None,
-                 metric="srtt", hysteresis=ROUTE_HYSTERESIS):
+                 metric="srtt", hysteresis=ROUTE_HYSTERESIS,
+                 keepalive_dados=False, tick_interval=None, active_hello_interval=10.0,
+                 refresh_interval=3.0, silence_factor=4.0, silence_min=0.5, silence_confirm=0.3):
         self.name = name
         self.boot_addr = tuple(boot_addr)
         self.hello_interval, self.dead_after = hello_interval, dead_after
         self.advert_interval = advert_interval
         self.route_stale_after = route_stale_after
         self.data_interval = data_interval
+        # --- extra "dados como keepalive" (desligado = baseline, HELLO em todas as arestas)
+        self.keepalive_dados = keepalive_dados
+        self.active_hello_interval = active_hello_interval   # HELLO esparso nas arestas com dados
+        self.refresh_interval = refresh_interval             # periodo do ACTIVATE (soft state)
+        self.silence_factor, self.silence_min = silence_factor, silence_min
+        self.silence_confirm = silence_confirm               # prazo para o HELLO de confirmacao
+        if tick_interval is None:
+            tick_interval = min(hello_interval, silence_min / 2) if keepalive_dados else hello_interval
+        self._tick_period = tick_interval
+        self._ultimo_refresh = 0.0
         self.player_addr = tuple(player_addr) if player_addr else None
         self.metric = metric
         self.hysteresis = hysteresis
@@ -259,7 +276,7 @@ class Node:
             data = wire.enc_name_msg(wire.T_HELLO, hid, self.name)
             self._send_reliable(acts, (ip, porta), hid, data,
                                 HELLO_RTO0, HELLO_RTO_MAX, HELLO_TRIES, "HELLO", peer=nome)
-        acts.append(SetTimer(("tick",), self.hello_interval))
+        acts.append(SetTimer(("tick",), self._tick_period))
         if any(r.local for r in self.rotas.values()):
             acts.append(SetTimer(("advert",), self.advert_interval))
             if self.data_interval:
@@ -328,7 +345,13 @@ class Node:
         if v is None:
             return
         v.last_heard = now
+        r = self.rotas.get(stream)
+        if r is not None and v.name in r.destinos:
+            r.visto[v.name] = now          # refresh: so renova o prazo do destino
+            return
         self.adicionar_destino_rota(acts, stream, v.name)
+        if r is not None:
+            r.visto[v.name] = now
 
     def _on_deactivate(self, acts, now, src, mid, payload):
         """Recebe cancelamento de stream de um vizinho a jusante."""
@@ -414,6 +437,7 @@ class Node:
         if v is None:
             return
         v.last_heard = now
+        self._nota_dados(v, now)
         r = self.rotas.get(stream)
 
         # Se nao temos rota ativa ou o pacote veio de quem nao e a nossa origem atual:
@@ -444,17 +468,107 @@ class Node:
 
     # ------------------------------------------------------------ monitorizacao dos vizinhos
     def _on_tick(self, acts, now):
-        acts.append(SetTimer(("tick",), self.hello_interval))
+        acts.append(SetTimer(("tick",), self._tick_period))
         self.probes = {m: pr for m, pr in self.probes.items() if now - pr[1] < self.dead_after}
         for v in self.vizinhos.values():
-            if v.alive and v.last_heard is not None and now - v.last_heard > self.dead_after:
+            if v.alive and v.last_heard is not None and now - v.last_heard > self._limite_silencio(v):
                 self._vizinho_caiu(acts, now, v)
             if any(p.kind == "HELLO" and p.peer == v.name for p in self.pending.values()):
                 continue
+            if self.keepalive_dados and not self._deve_sondar(v, now):
+                continue                    # aresta com dados: o proprio video prova que esta viva
+            v.last_probe = now
             mid = self._new_id()
             self.probes[mid] = (v.name, now)
             self._send(acts, v.addr, wire.enc_name_msg(wire.T_HELLO, mid, self.name))
+        if self.keepalive_dados:
+            self._refrescar_ativacoes(acts, now)
+            self._expirar_destinos(acts, now)
         self._expirar_rotas(acts, now)
+
+    # ------------------------------------------------------------ extra: dados como keepalive
+    def _nota_dados(self, v, now):
+        """Aprende o ritmo dos dados deste vizinho (media movel do intervalo entre pacotes)."""
+        if v.last_data is not None:
+            g = now - v.last_data
+            v.gap = g if v.gap is None else 0.8 * v.gap + 0.2 * min(g, 4 * v.gap)
+        v.last_data = now
+
+    def _papeis(self, v):
+        """(montante, jusante): v e a nossa origem numa rota ativa / v e destino de uma rota ativa."""
+        montante = jusante = False
+        for r in self.rotas.values():
+            if not r.ativa:
+                continue
+            if not r.local and r.origem == v.name:
+                montante = True
+            if v.name in r.destinos:
+                jusante = True
+        return montante, jusante
+
+    def _suspeita_dados(self, v):
+        """Silencio de dados a partir do qual SUSPEITAMOS do vizinho a montante (None se nao se
+        aplica). Suspeitar nao e declarar a morte: silencio de dados tambem acontece quando o
+        vizinho esta vivo mas ficou sem dados dele (falha mais acima). Por isso confirma-se com HELLO."""
+        if not self.keepalive_dados:
+            return None
+        montante, _ = self._papeis(v)
+        if montante and v.gap is not None:
+            return min(self.dead_after - self.silence_confirm,
+                       max(self.silence_min, self.silence_factor * v.gap))
+        return None
+
+    def _limite_silencio(self, v):
+        """Silencio a partir do qual o vizinho e dado como caido.
+        Baseline: sempre dead_after. Com o extra: se o vizinho nos envia video, bastam alguns
+        intervalos entre pacotes sem dados (limitado por dead_after); se so recebe de nos, o
+        prazo e o do soft state (3 refrescos)."""
+        if not self.keepalive_dados:
+            return self.dead_after
+        montante, jusante = self._papeis(v)
+        limites = []
+        if montante:
+            susp = self._suspeita_dados(v)
+            # suspeita + prazo de confirmacao: so se da como morto se o HELLO tambem nao for respondido
+            limites.append(susp + self.silence_confirm if susp is not None else self.dead_after)
+        if jusante and not montante:
+            limites.append(max(self.dead_after, 3 * self.refresh_interval))
+        return min(limites) if limites else self.dead_after
+
+    def _deve_sondar(self, v, now):
+        """HELLO periodico: todos os hello_interval nas arestas sem dados; so a cada
+        active_hello_interval (para o RTT) nas arestas onde o video ja prova que esta viva."""
+        if v.last_probe is None:
+            return True
+        susp = self._suspeita_dados(v)
+        if susp is not None and v.last_heard is not None and now - v.last_heard > susp:
+            # os dados calaram-se: confirma ja, com um HELLO (e repete ate haver resposta)
+            return now - v.last_probe >= self.silence_confirm / 2 - 1e-9
+        montante, jusante = self._papeis(v)
+        com_dados = (montante and v.last_data is not None
+                     and now - v.last_data <= self._limite_silencio(v))
+        com_dados = com_dados or (jusante and not montante)
+        intervalo = self.active_hello_interval if com_dados else self.hello_interval
+        return now - v.last_probe >= intervalo - 1e-9
+
+    def _refrescar_ativacoes(self, acts, now):
+        """Soft state: repete o ACTIVATE a montante enquanto a rota esta ativa."""
+        if now - self._ultimo_refresh < self.refresh_interval:
+            return
+        self._ultimo_refresh = now
+        for r in self.rotas.values():
+            if r.ativa and not r.local and r.origem is not None:
+                self._enviar_controlo_rota(acts, wire.T_ACTIVATE, r.origem, r.stream)
+
+    def _expirar_destinos(self, acts, now):
+        """Soft state: um destino que deixou de renovar o ACTIVATE durante 3 periodos e apagado."""
+        limite = 3 * self.refresh_interval
+        for r in self.rotas.values():
+            for d in sorted(r.destinos):
+                desde = r.visto.get(d)
+                if desde is not None and now - desde > limite:
+                    acts.append(Log(f"destino {d} da rota {r.stream} expirou (sem refresh ha {now - desde:.1f}s)"))
+                    self.remover_destino_rota(acts, r.stream, d)
 
     def _on_sonda_ack(self, acts, now, src, nome, t_envio):
         v = self.vizinhos.get(nome)
@@ -654,6 +768,7 @@ class Node:
             return False
         estava_ativa = r.ativa
         r.destinos.discard(vizinho_destino)
+        r.visto.pop(vizinho_destino, None)
         desativou_agora = estava_ativa and not r.ativa
         if desativou_agora:
             acts.append(Log(f"rota {stream} passou a INATIVA (sem clientes)"))
@@ -669,8 +784,12 @@ class Node:
 
             if r.origem == nome_viz:
                 tinha_jusante = r.tem_jusante
+                dist_viavel = r.custo      # custo que tinha pela origem que morreu
+                # condicao de viabilidade (DUAL): a alternativa tem de anunciar um custo estritamente
+                # menor do que a minha distancia viavel, senao o caminho dela pode passar por mim (ciclo)
                 validas = {v: (c, s) for v, (c, s) in r.alternativas.items()
-                           if v in self.vizinhos and self.vizinhos[v].alive and c != float("inf")}
+                           if v in self.vizinhos and self.vizinhos[v].alive and c != float("inf")
+                           and (c - self.custo_ligacao(v)) < dist_viavel}
                 if validas:
                     melhor_v = min(validas, key=lambda v: validas[v][0])
                     r.origem, (r.custo, r.seq) = melhor_v, r.alternativas.pop(melhor_v)
@@ -690,6 +809,7 @@ class Node:
             if now - r.last_updated > self.route_stale_after:
                 r.seq = None
                 r.alternativas.clear()
+                r.origem, r.custo = None, float("inf")    # custo velho nao pode bloquear (histerese) o anuncio novo
                 acts.append(Log(f"rota {r.stream} expirou por falta de anuncios (pronta para re-sincronizar seq)"))
 
 
