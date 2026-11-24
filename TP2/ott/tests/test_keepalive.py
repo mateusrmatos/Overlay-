@@ -15,7 +15,7 @@ from ottlib import wire                          # noqa: E402
 from ottlib.sim import Sim, BOOT                 # noqa: E402
 from ottlib.topology import Topology             # noqa: E402
 
-CLIENTES3 = ("O4", "O8", "O9", "O10", "O11")
+CLIENTES3 = ("C1", "C2", "C3", "C4", "C5")
 
 
 def cenario(n, serve, watch, loss=0.0):
@@ -52,15 +52,15 @@ def buraco_max(s, cliente, kill_at):
 
 class TestKeepalive(unittest.TestCase):
     def test_menos_trafego_de_controlo_que_a_baseline(self):
-        t = lambda: cenario(3, "O1", CLIENTES3)
+        t = lambda: cenario(3, "S1", CLIENTES3)
         base = controlo_por_s(corre(t(), False, 60), 20, 60)
         extra = controlo_por_s(corre(t(), True, 60), 20, 60)
         self.assertLess(extra, 0.5 * base, f"baseline={base:.1f}/s extra={extra:.1f}/s")
 
     def test_failover_bem_mais_rapido(self):
-        t = lambda: cenario(3, "O1", CLIENTES3)
-        base = buraco_max(corre(t(), False, 70, kill="O3"), "O10", 40.0)
-        extra = buraco_max(corre(t(), True, 70, kill="O3"), "O10", 40.0)
+        t = lambda: cenario(3, "S1", CLIENTES3)
+        base = buraco_max(corre(t(), False, 70, kill="O3"), "C4", 40.0)
+        extra = buraco_max(corre(t(), True, 70, kill="O3"), "C4", 40.0)
         self.assertGreater(base, 3.0)          # baseline: ~3 s de silencio + granularidade
         self.assertLess(extra, 1.5)            # extra: suspeita + confirmacao
         self.assertLess(extra, base / 2)
@@ -68,12 +68,12 @@ class TestKeepalive(unittest.TestCase):
     def test_no_isolado_continua_sem_recuperacao(self):
         """O O4 so tem o O3 como vizinho: morte catastrofica, nenhuma versao o salva
         (e o caso do extra do bootstrapper)."""
-        s = corre(cenario(3, "O1", CLIENTES3), True, 70, kill="O3")
-        self.assertEqual(buraco_max(s, "O4", 40.0), float("inf"))
+        s = corre(cenario(3, "S1", CLIENTES3), True, 70, kill="O3")
+        self.assertEqual(buraco_max(s, "C1", 40.0), float("inf"))
 
     def test_sem_falsas_mortes_numa_rede_sem_perdas(self):
         for extra in (False, True):
-            s = corre(cenario(3, "O1", CLIENTES3), extra, 120)
+            s = corre(cenario(3, "S1", CLIENTES3), extra, 120)
             falsas = [x for x in s.logs if "CAIU" in x[2]]
             self.assertEqual(falsas, [], f"extra={extra}")
 
@@ -96,7 +96,7 @@ class TestKeepalive(unittest.TestCase):
         self.assertGreaterEqual(n, 1)
 
     def test_o_extra_nao_contacta_o_bootstrapper(self):
-        s = corre(cenario(3, "O1", CLIENTES3), True, 70, kill="O3")
+        s = corre(cenario(3, "S1", CLIENTES3), True, 70, kill="O3")
         depois = [p for p in s.trace if BOOT in (p[1], p[2]) and p[0] > 10]
         self.assertEqual(depois, [])
 

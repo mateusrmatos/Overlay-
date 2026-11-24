@@ -35,7 +35,8 @@ class TestCenarioBase(unittest.TestCase):
             g = gaps(extra, "N1")
             for c in CL:
                 self.assertLess(g[c], 5.0, f"extra={extra} {c}")
-        self.assertLess(gaps(True, "N1")["C1"], 1.5)
+        # sem sucessor viavel (condicao DUAL) o N3 espera pelo proximo ADVERT (2 s): ~2 s com o extra
+        self.assertLess(gaps(True, "N1")["C1"], 3.0)
 
     def test_morre_N2_so_o_C3_sente(self):
         g = gaps(True, "N2")
@@ -47,7 +48,7 @@ class TestCenarioBase(unittest.TestCase):
         g = gaps(True, "N3")
         self.assertEqual(g["C1"], INF)
         self.assertEqual(g["C2"], INF)
-        self.assertLess(g["C4"], 1.5)
+        self.assertLess(g["C4"], 3.0)
         self.assertLess(g["C3"], 0.2)
 
     def test_morre_N4_so_o_C3_fica_isolado(self):
@@ -56,9 +57,20 @@ class TestCenarioBase(unittest.TestCase):
         for c in ("C1", "C2", "C4"):
             self.assertLess(g[c], 0.2, c)
 
-    def test_extra_recupera_pelo_menos_3x_mais_depressa(self):
+    def test_extra_recupera_pelo_menos_1_5x_mais_depressa(self):
         b, e = gaps(False, "N1"), gaps(True, "N1")
-        self.assertGreater(b["C1"], 3 * e["C1"])
+        self.assertGreater(b["C1"], 1.5 * e["C1"])
+
+    def test_regressao_sem_ciclo_N2_N3_quando_morre_N1(self):
+        """Com a metrica por atraso, N2 e N3 tinham-se um ao outro como alternativa (custo 30 cada, stale) e
+        ficavam presos a apontar um para o outro. A condicao de viabilidade (DUAL) e a expiracao que limpa a
+        origem impedem isto: no fim ninguem aponta para quem aponta para si, e todos os clientes voltam a receber."""
+        s = corre(cenario(5, "S1", CL), True, 75, kill="N1")
+        pai = {n: s.logic[n].rotas["video1"].origem for n in ("N2", "N3", "N4")}
+        for a, b in (("N2", "N3"), ("N3", "N4"), ("N2", "N4")):
+            self.assertFalse(pai[a] == b and pai[b] == a, f"ciclo {a}<->{b}: {pai}")
+        for c in ("C1", "C2", "C3", "C4"):
+            self.assertLess(buraco_max(s, c, 40.0), 5.0, c)
 
 
 if __name__ == "__main__":
